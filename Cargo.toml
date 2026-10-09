@@ -1,0 +1,14 @@
+[package]
+name = "sp1200-rs"
+version = "0.1.0"
+edition = "2021"
+description = "SP-1200 drum machine, native Rust + SDL2 port of the web version"
+
+[dependencies]
+sdl2 = "0.37"
+
+[profile.release]
+opt-level = 3
+
+[lints.rust]
+warnings = "deny"
