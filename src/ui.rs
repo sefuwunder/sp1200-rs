@@ -184,6 +184,10 @@ pub struct Ui {
     pub selected_pad: usize,
     pub preset: usize,
     taps: Vec<Instant>,
+    /// Where `W` saves the project (set by --project or a dropped .json).
+    pub project_path: Option<String>,
+    /// Transient status line: (text, show-until, is-error).
+    msg: Option<(String, Instant, bool)>,
 }
 
 impl Ui {
@@ -192,7 +196,21 @@ impl Ui {
             selected_pad: 0,
             preset: 0,
             taps: Vec::new(),
+            project_path: None,
+            msg: None,
         }
+    }
+
+    /// Show a transient info message (4 s).
+    pub fn say(&mut self, text: impl Into<String>) {
+        let t: String = text.into().chars().take(110).collect();
+        self.msg = Some((t, Instant::now() + std::time::Duration::from_secs(4), false));
+    }
+
+    /// Show a transient error message (6 s).
+    pub fn say_err(&mut self, text: impl Into<String>) {
+        let t: String = text.into().chars().take(110).collect();
+        self.msg = Some((t, Instant::now() + std::time::Duration::from_secs(6), true));
     }
 }
 
@@ -278,8 +296,41 @@ pub fn handle_event(ui: &mut Ui, eng: &mut Engine, ev: &Event) -> bool {
                 eng.apply_preset(2);
                 ui.preset = 2;
             }
+            Keycode::S => match eng.splice_onset() {
+                Some(n) => ui.say(format!("SPLICED: {n} CHOPS")),
+                None => ui.say_err("NO TAPE (DROP A .WAV)"),
+            },
+            Keycode::E => match eng.splice_equal() {
+                Some(n) => ui.say(format!("SLICED: {n} EQUAL PARTS")),
+                None => ui.say_err("NO TAPE (DROP A .WAV)"),
+            },
+            Keycode::D => {
+                eng.clear_tape();
+                ui.say("TAPE CLEARED");
+            }
+            Keycode::W => {
+                let path = ui
+                    .project_path
+                    .clone()
+                    .unwrap_or_else(|| "./sp1200-project.json".to_string());
+                let stem = path
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .unwrap_or("sp1200-project.json");
+                let name = stem.rsplit_once('.').map(|(s, _)| s).unwrap_or(stem);
+                match crate::project::save_native_file(eng, &path, name) {
+                    Ok(()) => {
+                        ui.project_path = Some(path.clone());
+                        ui.say(format!("SAVED {path}"));
+                    }
+                    Err(e) => ui.say_err(e),
+                }
+            }
             _ => {}
         },
+        Event::DropFile { filename, .. } => {
+            drop_path(ui, eng, filename);
+        }
         Event::MouseButtonDown {
             mouse_btn: MouseButton::Left,
             x,
@@ -301,9 +352,26 @@ pub fn handle_event(ui: &mut Ui, eng: &mut Engine, ev: &Event) -> bool {
 
 // ---------- drawing ----------
 
-const DRUM_LABELS: [&str; 8] = [
-    "KICK", "SNARE", "CLAP", "RIM", "CHAT", "OHAT", "TOM", "SHAKER",
-];
+fn drop_path(ui: &mut Ui, eng: &mut Engine, path: &str) {
+    let lower = path.to_lowercase();
+    if lower.ends_with(".wav") {
+        match crate::engine::load_tape_file(eng, path) {
+            Ok(m) => ui.say(m),
+            Err(e) => ui.say_err(e),
+        }
+    } else if lower.ends_with(".json") {
+        match crate::project::load_project_file(eng, path) {
+            Ok(m) => {
+                ui.project_path = Some(path.to_string());
+                ui.say(m);
+            }
+            Err(e) => ui.say_err(e),
+        }
+    } else {
+        let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+        ui.say_err(format!("can't open {name} (drop .wav or .json)"));
+    }
+}
 
 fn mix(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> (u8, u8, u8) {
     let t = t.clamp(0.0, 1.0);
@@ -332,6 +400,9 @@ pub fn draw(p: &mut dyn Painter, ui: &Ui, eng: &Engine) {
         rx -= 36;
     }
     p.text(24, 84, "PADS", 1, DIM);
+    if let Some(ts) = eng.tape_status() {
+        p.text(110, 84, &ts, 1, SEL);
+    }
 
     // pads
     for i in 0..N_PADS {
@@ -348,9 +419,9 @@ pub fn draw(p: &mut dyn Painter, ui: &Ui, eng: &Engine) {
             p.rect(x - 4, y - 4, w + 8, 4, SEL);
             p.rect(x - 4, y + h as i32, w + 8, 4, SEL);
         }
-        let label = DRUM_LABELS[i];
-        let tw = text_w(label, 2) as i32;
-        p.text(x + (w as i32 - tw) / 2, y + 34, label, 2, TEXT);
+        let label = eng.pad_label(i);
+        let tw = text_w(&label, 2) as i32;
+        p.text(x + (w as i32 - tw) / 2, y + 34, &label, 2, TEXT);
         let key = format!("{}", i + 1);
         p.text(x + 10, y + 10, &key, 1, DIM);
     }
@@ -373,7 +444,7 @@ pub fn draw(p: &mut dyn Painter, ui: &Ui, eng: &Engine) {
         let tw = text_w(&num, 1) as i32;
         p.text(x + (w as i32 - tw) / 2, y + 20, &num, 1, DIM);
     }
-    let sel_name = DRUM_LABELS[ui.selected_pad];
+    let sel_name = eng.pad_label(ui.selected_pad);
     p.text(120, 384, &format!("EDITING: {}", sel_name), 1, SEL);
 
     // presets
@@ -392,19 +463,26 @@ pub fn draw(p: &mut dyn Painter, ui: &Ui, eng: &Engine) {
         p.text(W as i32 - 200, 532, "STOPPED", 2, DIM);
     }
 
+    // transient status / error message
+    if let Some((text, until, is_err)) = &ui.msg {
+        if Instant::now() <= *until {
+            p.text(24, 550, text, 1, if *is_err { PLAYHEAD } else { TEXT });
+        }
+    }
+
     // footer help
     p.rect(0, 566, W, H - 566, PLATE);
     p.text(
         24,
         584,
-        "SPACE PLAY/STOP  T TAP  </> SWING  UP/DN MASTER  ,/. BPM  1-8 PADS  F1-F3 PRESETS  ESC QUIT",
+        "SPACE PLAY/STOP  T TAP  S/E SPLICE  D TAPE OFF  W SAVE  </> SWING  UP/DN MASTER  ,/. BPM  ESC QUIT",
         1,
         DIM,
     );
     p.text(
         24,
         606,
-        "CLICK PADS TO HIT - CLICK STEPS TO PROGRAM",
+        "1-8 PADS  F1-F3 PRESETS  CLICK PADS/STEPS  DROP .WAV FOR TAPE - DROP .JSON FOR PROJECT",
         1,
         DIM,
     );
@@ -413,6 +491,7 @@ pub fn draw(p: &mut dyn Painter, ui: &Ui, eng: &Engine) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sdl2::pixels::PixelFormatEnum;
 
     #[test]
     fn font_covers_needed_chars() {
@@ -425,5 +504,65 @@ mod tests {
     fn text_width_math() {
         assert_eq!(text_w("AB", 1), 12);
         assert_eq!(text_w("AB", 2), 24);
+    }
+
+    #[test]
+    fn w_key_saves_project_to_chosen_path() {
+        let dir = std::env::temp_dir().join(format!("sp1200rs-w-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mine.json");
+        let mut eng = Engine::new();
+        eng.bpm = 133.0;
+        let mut ui = Ui::new();
+        ui.project_path = Some(path.to_str().unwrap().to_string());
+        let ev = Event::KeyDown {
+            timestamp: 0,
+            window_id: 0,
+            keycode: Some(Keycode::W),
+            scancode: None,
+            keymod: sdl2::keyboard::Mod::NOMOD,
+            repeat: false,
+        };
+        assert!(!handle_event(&mut ui, &mut eng, &ev));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"bpm\": 133.0"), "{text}");
+        assert!(text.contains("\"format\": \"sp1200-rs\""), "{text}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn draw_tape_mode_no_panic() {
+        let mut eng = Engine::new();
+        // Synthetic tape: 6 onset-separated regions.
+        let mut audio = Vec::new();
+        for _ in 0..6 {
+            audio.push(2047);
+            audio.extend(std::iter::repeat(300i16).take(3000));
+        }
+        let n = eng.load_tape("TESTTAPE".to_string(), audio);
+        assert!(n >= 6);
+        eng.play();
+        let mut buf = vec![0.0f32; 5000];
+        eng.render(&mut buf);
+        let mut ui = Ui::new();
+        ui.say("TAPE TESTTAPE - 6 CHOPS");
+        ui.say_err("SOME ERROR");
+        let mut surf = Surface::new(W, H, PixelFormatEnum::RGB24).unwrap();
+        {
+            let p: &mut dyn Painter = &mut surf;
+            draw(p, &ui, &eng);
+        }
+        // And with markers but no audio (fresh project load).
+        eng.clear_tape();
+        eng.tape = Some(crate::engine::Tape {
+            name: "MARKERS".to_string(),
+            audio: Vec::new(),
+            chops: vec![(0, 100), (100, 200)],
+        });
+        eng.refresh_pad_samples();
+        {
+            let p: &mut dyn Painter = &mut surf;
+            draw(p, &ui, &eng);
+        }
     }
 }

@@ -6,9 +6,13 @@ The web app stays untouched; this is the same instrument compiled to a desktop
 binary.
 
 What it is: 8 synthesized drums through a 26.04 kHz / 12-bit signal path with
-varispeed tuning, Roger Linn swing, a 16-step sequencer, and an SP-1200-style
-2D faceplate. Zero Rust dependencies beyond `sdl2` for windowing/audio; the DSP
-core uses no crates at all (deterministic XorShift32 RNG, no `rand`).
+varispeed tuning, Roger Linn swing, a 16-step sequencer, tape loading with
+onset/equal splicing (chop-to-pads), JSON project save/load (plus web
+`.sp1200.json` import), and an SP-1200-style 2D faceplate. Dependencies are
+`sdl2` (windowing/audio), `serde`/`serde_json` (project files — a pragmatic
+call; base64 is hand-rolled in `project.rs`, ~30 lines, to avoid another
+crate); the DSP core uses no crates at all (deterministic XorShift32 RNG, no
+`rand`).
 
 ## Build
 
@@ -39,13 +43,52 @@ time).
 | `←` / `→` | Swing −1% / +1% (Roger Linn 50–75%) |
 | `↑` / `↓` | Master level |
 | `F1` `F2` `F3` | Factory presets: BOOM BAP / HOUSE / LOPE |
+| `S` | Re-splice the tape (onset detection) |
+| `E` | Slice the tape into 8 equal parts |
+| `D` | Clear the tape (pads revert to drums) |
+| `W` | Save the project as JSON (to the loaded path, else `./sp1200-project.json`) |
+| Drop a `.wav` | Load it as the tape (through the 12-bit path, auto-spliced) |
+| Drop a `.json` | Load a project (`.sp1200.json` = web import, otherwise native) |
 | `Esc` / `Q` | Quit |
+
+## Tape & splicing
+
+`sp1200-rs --tape break.wav` (or drop the file onto the window) loads a tape:
+16-bit PCM or 32-bit float WAV, mono or stereo (mixed down), any sample rate —
+decoded by a small zero-dependency reader in `src/wav.rs`, normalized like the
+web (`normalize(clean, 0.92)`), then run through the SP-1200 converters
+(resample to 26.04 kHz + 12-bit quantize).
+
+On load the tape is auto-spliced by onset detection; `S` re-splices, `E`
+slices into 8 equal parts, `D` clears it. Pads 1–8 trigger chops 1–8 (more
+than 8 chops: the first 8; the readout shows `8/N CHOPS`). Per-pad tune still
+applies — varispeed on chops, the classic. The 16-step sequencer keeps working
+and fires chops like drums.
+
+## Projects
+
+`W` saves the native JSON format (versioned, `format: "sp1200-rs"`): name,
+bpm, swing, master, per-pad tune/level (and optional per-pad chop override),
+the full 16-step pattern, and tape name + chop markers. Tape *audio* is not
+embedded — load the project, then drop the `.wav`, and the saved chops apply
+to it. `sp1200-rs --project song.json` loads at startup; a dropped `.json`
+also sets the save path for `W`.
+
+**Web import:** files named `*.sp1200.json` are read as the browser app's
+project format (`serializeProject`): bpm/swing/master, per-pad tune (ratio →
+semitones) / level / label, custom pad samples (base64 pcm16 → the 12-bit
+path), and `tapes[0]` audio (base64 pcm16 stereo → mono → the 12-bit path).
+Filter/delay/loop/voice-mode/choke settings have no equivalent here and are
+ignored. Bad files (malformed JSON, wrong version, missing fields) show a
+clean on-screen error and leave the current state untouched.
 
 ## CLI
 
 ```sh
 sp1200-rs --render out.wav [seconds]   # render the fixed demo pattern to WAV
 sp1200-rs --shot out.bmp               # render one UI frame offscreen to BMP
+sp1200-rs --tape f.wav --shot out.bmp  # offscreen shot with a tape loaded
+sp1200-rs --project f.json             # load a project at startup
 sp1200-rs --smoke [secs]               # run the UI headless for N s, exit 0
 sp1200-rs --help
 ```
@@ -64,8 +107,16 @@ every run. It is the artifact the parity test compares.
 - `src/engine.rs` — 8 pads (i16 samples @ 26.04 kHz), per-pad tune (varispeed
   ratio) and level, 16-voice polyphonic allocator with oldest-voice stealing,
   16-step per-pad sequencer with BPM + swing, live triggering alongside the
-  sequencer, 3 factory presets, and the exact-integer offline renderer used by
-  `--render`.
+  sequencer, 3 factory presets, tape state (name, 12-bit audio, chop regions;
+  pads 1–8 play chops, `D` restores the drum factory), and the exact-integer
+  offline renderer used by `--render`.
+- `src/wav.rs` — minimal zero-dependency WAV decoder (16-bit PCM / 32-bit
+  float, mono-downmixed, any sane rate); every malformed input is a clean
+  `WavError`, never a panic.
+- `src/project.rs` — native JSON projects (versioned; kit + pattern + tape
+  chop markers) and web `.sp1200.json` import (bpm/swing/master, per-pad
+  tune/level/label, custom pad samples, `tapes[0]` audio — all through the
+  12-bit path). Base64 is hand-rolled; JSON via `serde_json`.
 - `src/audio.rs` — SDL2 audio callback. The engine renders at 26.04 kHz; the
   callback linearly resamples to the device rate (44100 Hz requested) through
   a small persistent ring buffer.
@@ -99,8 +150,8 @@ XorShift32 bit ops with the seed used verbatim as state.
 
 ## v1 scope
 
-Playable core only. Deliberately out of scope (future work): loading/slicing
-sample files, per-pad filters and delay, project save/load, KO II / EP-133
-skins from the web app. The ported DSP helpers that the UI doesn't use yet
-(`trim_sample`, `reverse_sample`, `fade_sample`, `detect_onsets`,
-`sp1200ize`) are kept as tested API surface for the sample editor to come.
+Playable core plus tape/splice/project loading (this release). Deliberately
+out of scope (future work): per-pad filters and delay, KO II / EP-133 skins
+from the web app. The ported DSP helpers the UI doesn't use yet
+(`trim_sample`, `reverse_sample`, `fade_sample`, `sp1200ize`) are kept as
+tested API surface for the sample editor to come.

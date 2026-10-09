@@ -387,7 +387,6 @@ pub fn fade_sample(x: &[f32], fade_in_frac: f64, fade_out_frac: f64) -> Vec<f32>
 // ---------- tape slicer: transient (onset) detection ----------
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // ported API surface (mirrors dsp.js); wired up by future sample-editor work
 pub struct OnsetOpts {
     pub window: usize,
     pub hop: usize,
@@ -408,7 +407,6 @@ impl Default for OnsetOpts {
 
 /// Energy-flux onset detection: returns sample offsets where the signal's
 /// short-time energy jumps.
-#[allow(dead_code)] // ported API surface (mirrors dsp.js); wired up by future sample-editor work
 pub fn detect_onsets(x: &[f32], sr: f64, opts: &OnsetOpts) -> Vec<usize> {
     let win = opts.window;
     let hop = opts.hop;
@@ -444,6 +442,42 @@ pub fn detect_onsets(x: &[f32], sr: f64, opts: &OnsetOpts) -> Vec<usize> {
         }
     }
     onsets
+}
+
+// ---------- splicing: chop boundaries from onsets ----------
+
+/// Turn onset offsets into chop regions over 12-bit tape audio: boundaries
+/// at 0, every onset, and the end; regions closer than 1024 samples merge;
+/// capped at 64 chops.
+pub fn onset_chops(audio: &[i16], sr: f64) -> Vec<(usize, usize)> {
+    let f: Vec<f32> = audio
+        .iter()
+        .map(|&s| s as f32 / QUANT_SCALE as f32)
+        .collect();
+    let onsets = detect_onsets(&f, sr, &OnsetOpts::default());
+    let mut bounds = Vec::with_capacity(onsets.len() + 2);
+    bounds.push(0usize);
+    bounds.extend(onsets.into_iter().filter(|&o| o < audio.len()));
+    bounds.push(audio.len());
+    bounds.sort_unstable();
+    bounds.dedup();
+    let mut merged: Vec<usize> = vec![bounds[0]];
+    for &b in &bounds[1..] {
+        if b - *merged.last().unwrap() >= 1024 {
+            merged.push(b);
+        }
+    }
+    merged
+        .windows(2)
+        .map(|w| (w[0], w[1]))
+        .filter(|&(a, b)| b > a)
+        .take(64)
+        .collect()
+}
+
+/// 8 contiguous regions covering the whole tape.
+pub fn equal_chops(len: usize) -> Vec<(usize, usize)> {
+    (0..8).map(|i| (i * len / 8, (i + 1) * len / 8)).collect()
 }
 
 #[cfg(test)]
@@ -563,5 +597,35 @@ mod tests {
         assert_eq!(onsets.len(), 2, "got {onsets:?}");
         assert!((onsets[0] as i32 - 5000).abs() < 1500, "got {onsets:?}");
         assert!((onsets[1] as i32 - 25000).abs() < 1500, "got {onsets:?}");
+    }
+
+    #[test]
+    fn onset_chops_finds_click_track() {
+        // 8 impulses, 0.25 s apart, @26.04 kHz.
+        let sr = SP_RATE;
+        let gap = (0.25 * sr) as usize; // 6510
+        let mut audio = vec![0i16; gap * 8 + 2000];
+        for k in 0..8 {
+            audio[k * gap] = 2047;
+            audio[k * gap + 1] = -1500;
+        }
+        let chops = onset_chops(&audio, sr);
+        assert_eq!(chops.len(), 8, "got {chops:?}");
+        for (k, &(a, b)) in chops.iter().enumerate() {
+            assert!((a as i32 - (k * gap) as i32).abs() < 1200, "chop {k}: {a}");
+            assert!(b > a);
+        }
+        // Contiguous and covering: last chop ends at the tape end.
+        assert_eq!(chops[7].1, audio.len());
+    }
+
+    #[test]
+    fn equal_chops_covers_tape_contiguously() {
+        let chops = equal_chops(8000);
+        assert_eq!(chops.len(), 8);
+        for (i, &(a, b)) in chops.iter().enumerate() {
+            assert_eq!(a, i * 1000);
+            assert_eq!(b, (i + 1) * 1000);
+        }
     }
 }

@@ -6,6 +6,10 @@ description = "SP-1200 drum machine, native Rust + SDL2 port of the web version"
 
 [dependencies]
 sdl2 = "0.37"
+# Pragmatic call (see README): serde_json for project files; base64 is
+# hand-rolled in project.rs (~30 lines) to avoid another dependency.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [profile.release]
 opt-level = 3

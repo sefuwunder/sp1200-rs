@@ -20,6 +20,9 @@ pub struct Pad {
     pub sample: Vec<i16>,
     pub tune_st: f32,
     pub level: f32,
+    /// Optional display label (from web project import); falls back to the
+    /// drum name, or CHOP n in tape mode.
+    pub label: Option<String>,
 }
 
 impl Pad {
@@ -28,6 +31,20 @@ impl Pad {
     pub fn ratio(&self) -> f64 {
         2f64.powf(self.tune_st as f64 / 12.0)
     }
+}
+
+/// The 8 drum voices, in pad order.
+pub const DRUM_LABELS: [&str; N_PADS] = [
+    "KICK", "SNARE", "CLAP", "RIM", "CHAT", "OHAT", "TOM", "SHAKER",
+];
+
+/// A loaded tape: 12-bit audio @ 26.04 kHz plus chop regions (sample
+/// offsets into `audio`). Empty `audio` means "markers without audio"
+/// (restored from a project file before the .wav is dropped).
+pub struct Tape {
+    pub name: String,
+    pub audio: Vec<i16>,
+    pub chops: Vec<(usize, usize)>,
 }
 
 #[derive(Clone, Copy)]
@@ -66,19 +83,32 @@ pub struct Engine {
     pub pad_hit_at: [u64; N_PADS],
     /// Last fired step within the bar (for the playhead LEDs).
     pub last_step: u32,
+    /// Loaded tape (if any). Pads 1-8 trigger chops 1-8 while audio is present.
+    pub tape: Option<Tape>,
+    /// Which chop each pad plays (None = drum). 1:1 by default; a native
+    /// project file may override individual pads.
+    pub(crate) chop_map: [Option<usize>; N_PADS],
+    /// Drum-mode samples (synths, or web-imported customs): what pads
+    /// revert to when the tape is cleared.
+    pub(crate) pad_factory: Vec<Vec<i16>>,
 }
 
 impl Engine {
     pub fn new() -> Self {
         let mut rng = XorShift32::new(DRUM_SEED);
-        let pads = DRUM_NAMES
+        let pads: Vec<Pad> = DRUM_NAMES
             .iter()
             .map(|name| Pad {
                 sample: dsp::synth_drum_i16(name, &mut rng),
                 tune_st: 0.0,
                 level: 0.9,
+                label: None,
             })
             .collect();
+        let pad_factory = pads
+            .iter()
+            .map(|p: &Pad| p.sample.clone())
+            .collect::<Vec<_>>();
         let mut e = Self {
             pads,
             voices: [Voice::idle(); N_VOICES],
@@ -94,6 +124,9 @@ impl Engine {
             voice_age: 0,
             pad_hit_at: [0; N_PADS],
             last_step: 0,
+            tape: None,
+            chop_map: [None; N_PADS],
+            pad_factory,
         };
         e.apply_preset(0);
         e
@@ -141,6 +174,155 @@ impl Engine {
         for v in self.voices.iter_mut() {
             v.active = false;
         }
+    }
+
+    // ---------- tape ----------
+
+    /// Load tape audio (12-bit @ 26.04 kHz): auto-splice via onset
+    /// detection, pads 1-8 take chops 1-8. If chop markers were restored
+    /// from a project file (tape with no audio yet), the dropped tape
+    /// inherits them instead of being re-spliced. Returns the chop count.
+    pub fn load_tape(&mut self, name: String, audio: Vec<i16>) -> usize {
+        let marked = match &self.tape {
+            Some(t) if t.audio.is_empty() && !t.chops.is_empty() => Some(t.chops.clone()),
+            _ => None,
+        };
+        let chops = if audio.is_empty() {
+            Vec::new()
+        } else {
+            let fallback = || {
+                let mut c = dsp::onset_chops(&audio, SP_RATE);
+                if c.is_empty() {
+                    c = vec![(0, audio.len())];
+                }
+                c
+            };
+            match marked {
+                Some(m) => {
+                    let n = audio.len();
+                    let v: Vec<(usize, usize)> = m
+                        .into_iter()
+                        .map(|(a, b)| (a.min(n), b.min(n)))
+                        .filter(|&(a, b)| b > a)
+                        .collect();
+                    if v.is_empty() {
+                        fallback()
+                    } else {
+                        v
+                    }
+                }
+                None => fallback(),
+            }
+        };
+        self.chop_map = [None; N_PADS];
+        self.tape = Some(Tape { name, audio, chops });
+        self.refresh_pad_samples();
+        self.tape.as_ref().map(|t| t.chops.len()).unwrap_or(0)
+    }
+
+    /// Re-splice the loaded tape with onset detection. None if no tape.
+    pub fn splice_onset(&mut self) -> Option<usize> {
+        let chops = {
+            let t = self.tape.as_ref()?;
+            if t.audio.is_empty() {
+                return None;
+            }
+            let mut c = dsp::onset_chops(&t.audio, SP_RATE);
+            if c.is_empty() {
+                c = vec![(0, t.audio.len())];
+            }
+            c
+        };
+        self.tape.as_mut().unwrap().chops = chops;
+        self.refresh_pad_samples();
+        Some(self.tape.as_ref().unwrap().chops.len())
+    }
+
+    /// Slice the loaded tape into 8 equal parts. None if no tape.
+    pub fn splice_equal(&mut self) -> Option<usize> {
+        let chops = {
+            let t = self.tape.as_ref()?;
+            if t.audio.is_empty() {
+                return None;
+            }
+            dsp::equal_chops(t.audio.len())
+        };
+        self.tape.as_mut().unwrap().chops = chops;
+        self.refresh_pad_samples();
+        Some(self.tape.as_ref().unwrap().chops.len())
+    }
+
+    /// Clear the tape: pads revert to their drum-mode samples.
+    pub fn clear_tape(&mut self) {
+        self.tape = None;
+        self.refresh_pad_samples();
+    }
+
+    /// Re-derive pad samples from the tape + chop map. Pads without a chop
+    /// (or with no tape audio) play their drum-mode sample.
+    pub(crate) fn refresh_pad_samples(&mut self) {
+        let resolved: Vec<(Vec<i16>, Option<usize>)> = (0..N_PADS)
+            .map(|i| {
+                if let Some(t) = &self.tape {
+                    if !t.audio.is_empty() {
+                        let n = t.chops.len().min(N_PADS);
+                        let ci = match self.chop_map[i] {
+                            Some(c) if c < t.chops.len() => c,
+                            _ => i,
+                        };
+                        if ci < n {
+                            let (a, b) = t.chops[ci];
+                            return (t.audio[a..b].to_vec(), Some(ci));
+                        }
+                    }
+                }
+                (self.pad_factory[i].clone(), None)
+            })
+            .collect();
+        for (i, (s, m)) in resolved.into_iter().enumerate() {
+            self.pads[i].sample = s;
+            self.chop_map[i] = m;
+        }
+    }
+
+    /// Install a custom drum-mode sample (web project import): it becomes
+    /// the pad's drum-mode sound and what `clear_tape` restores. A pad
+    /// currently playing a chop keeps the chop until the next splice.
+    pub(crate) fn set_custom_pad(&mut self, i: usize, sample: Vec<i16>, label: Option<String>) {
+        if i >= N_PADS {
+            return;
+        }
+        self.pad_factory[i] = sample.clone();
+        self.pads[i].label = label;
+        if self.chop_map[i].is_none() {
+            self.pads[i].sample = sample;
+        }
+    }
+
+    /// Display label for a pad: CHOP n in tape mode, else custom label or
+    /// the drum name.
+    pub fn pad_label(&self, i: usize) -> String {
+        if let Some(c) = self.chop_map[i] {
+            return format!("CHOP {}", c + 1);
+        }
+        if let Some(l) = &self.pads[i].label {
+            return l.clone();
+        }
+        DRUM_LABELS[i].to_string()
+    }
+
+    /// One-line tape readout for the UI, or None when no tape is loaded.
+    pub fn tape_status(&self) -> Option<String> {
+        self.tape.as_ref().map(|t| {
+            let n = t.chops.len();
+            if t.audio.is_empty() {
+                format!("TAPE: {} - NO AUDIO", t.name)
+            } else if n <= N_PADS {
+                format!("TAPE: {} - {} CHOPS", t.name, n)
+            } else {
+                format!("TAPE: {} - {}/{} CHOPS", t.name, N_PADS, n)
+            }
+        })
     }
 
     fn fire_step(&mut self, step: u64) {
@@ -327,6 +509,37 @@ pub fn fit_to_seconds(samples: &[i16], seconds: f64) -> Vec<i16> {
     out
 }
 
+// ---------- tape file loading ----------
+
+fn file_name(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+fn file_stem(path: &str) -> String {
+    let f = file_name(path);
+    match f.rfind('.') {
+        Some(i) => f[..i].to_string(),
+        None => f.to_string(),
+    }
+}
+
+/// Load a .wav as the tape: decode → normalize (like the web) → the 12-bit
+/// path → auto-splice. Returns a status line for the UI.
+pub fn load_tape_file(eng: &mut Engine, path: &str) -> Result<String, String> {
+    let data = std::fs::read(path).map_err(|e| format!("can't read {}: {e}", file_name(path)))?;
+    let wav = crate::wav::decode_wav(&data).map_err(|e| format!("{}: {e}", file_name(path)))?;
+    if wav.samples.is_empty() {
+        return Err(format!("{}: no audio", file_name(path)));
+    }
+    // Mirror the web pipeline: normalize clean, then the SP-1200 converters.
+    let mut clean = wav.samples;
+    dsp::normalize(&mut clean, 0.92);
+    let audio = dsp::sp1200ize_i16(&clean, wav.sample_rate as f64);
+    let name: String = file_stem(path).to_uppercase().chars().take(18).collect();
+    let n = eng.load_tape(name.clone(), audio);
+    Ok(format!("TAPE {name} - {n} CHOPS (S/E RESPLICE, D CLEAR)"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,5 +597,128 @@ mod tests {
         assert_eq!(padded[150], 0);
         let cut = fit_to_seconds(&s, 50.0 / SP_RATE);
         assert_eq!(cut.len(), 50);
+    }
+
+    /// Synthetic tape: 4 regions with distinct constant values.
+    fn region_tape() -> Vec<i16> {
+        let mut t = Vec::new();
+        for r in 0..4 {
+            // Each region: loud click then a distinct DC-ish level.
+            t.push(2047);
+            t.extend(std::iter::repeat((r as i16 + 1) * 200).take(4999));
+        }
+        t
+    }
+
+    #[test]
+    fn tape_load_splices_and_assigns_chop_pads() {
+        let mut e = Engine::new();
+        let n = e.load_tape("TEST".to_string(), region_tape());
+        assert_eq!(n, 4);
+        assert_eq!(e.pad_label(0), "CHOP 1");
+        assert_eq!(e.pad_label(3), "CHOP 4");
+        assert_eq!(e.pad_label(4), "CHAT"); // beyond the chops: drum
+        assert_eq!(e.tape_status().unwrap(), "TAPE: TEST - 4 CHOPS");
+        // Pad 3 plays the tape's 3rd chop region (level/master 1.0).
+        e.pads[2].level = 1.0;
+        e.master = 1.0;
+        let (a, b) = e.tape.as_ref().unwrap().chops[2];
+        e.trigger(2);
+        let mut out = vec![0.0f32; b - a];
+        e.render(&mut out);
+        // Note: the voice mixer cuts the final sample (its `idx + 1`
+        // bounds guard), so compare all but the last.
+        for (i, &s) in out.iter().enumerate().take(out.len() - 1) {
+            let expect = e.tape.as_ref().unwrap().audio[a + i] as f32 / 2047.0;
+            assert!((s - expect).abs() < 1e-6, "sample {i}: {s} vs {expect}");
+        }
+    }
+
+    #[test]
+    fn splice_equal_assigns_first_eight() {
+        let mut e = Engine::new();
+        e.load_tape("EQ".to_string(), vec![100i16; 8000]);
+        let n = e.splice_equal().unwrap();
+        assert_eq!(n, 8);
+        let chops = &e.tape.as_ref().unwrap().chops;
+        assert_eq!(chops[0], (0, 1000));
+        assert_eq!(chops[7], (7000, 8000));
+        assert_eq!(e.pad_label(7), "CHOP 8");
+    }
+
+    #[test]
+    fn more_than_eight_chops_shows_first_eight() {
+        let mut e = Engine::new();
+        // 12 onset-separated regions.
+        let mut t = Vec::new();
+        for _ in 0..12 {
+            t.push(2047);
+            t.extend(std::iter::repeat(300i16).take(3000));
+        }
+        let n = e.load_tape("MANY".to_string(), t);
+        assert!(n >= 12, "got {n}");
+        assert_eq!(
+            e.tape_status().unwrap(),
+            format!("TAPE: MANY - 8/{n} CHOPS")
+        );
+        assert_eq!(e.pad_label(7), "CHOP 8");
+    }
+
+    #[test]
+    fn clear_tape_restores_drums() {
+        let mut e = Engine::new();
+        let drum0 = e.pads[0].sample.clone();
+        e.load_tape("X".to_string(), region_tape());
+        assert_ne!(e.pads[0].sample, drum0);
+        e.clear_tape();
+        assert_eq!(e.pads[0].sample, drum0);
+        assert!(e.tape.is_none());
+        assert_eq!(e.pad_label(0), "KICK");
+    }
+
+    #[test]
+    fn custom_pad_survives_tape_clear() {
+        let mut e = Engine::new();
+        let custom = vec![1234i16; 500];
+        e.set_custom_pad(0, custom.clone(), Some("MINE".to_string()));
+        assert_eq!(e.pads[0].sample, custom);
+        assert_eq!(e.pad_label(0), "MINE");
+        e.load_tape("X".to_string(), region_tape());
+        e.clear_tape();
+        assert_eq!(e.pads[0].sample, custom);
+    }
+
+    #[test]
+    fn splice_without_tape_is_none() {
+        let mut e = Engine::new();
+        assert_eq!(e.splice_onset(), None);
+        assert_eq!(e.splice_equal(), None);
+    }
+
+    #[test]
+    fn dropped_tape_inherits_project_markers() {
+        let mut e = Engine::new();
+        // Simulate a project load: markers, no audio.
+        e.tape = Some(Tape {
+            name: "SAVED".to_string(),
+            audio: Vec::new(),
+            chops: vec![(0, 1000), (1000, 3000)],
+        });
+        // Drop a tape: saved chops apply instead of onset detection.
+        let n = e.load_tape("NEWFILE".to_string(), vec![100i16; 5000]);
+        assert_eq!(n, 2);
+        assert_eq!(
+            e.tape.as_ref().unwrap().chops,
+            vec![(0, 1000), (1000, 3000)]
+        );
+        // Markers beyond the audio are clamped; degenerate ones dropped.
+        e.tape = Some(Tape {
+            name: "SAVED".to_string(),
+            audio: Vec::new(),
+            chops: vec![(0, 99999), (5000, 5000)],
+        });
+        let n = e.load_tape("NEWFILE".to_string(), vec![100i16; 5000]);
+        assert_eq!(n, 1);
+        assert_eq!(e.tape.as_ref().unwrap().chops, vec![(0, 5000)]);
     }
 }

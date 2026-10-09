@@ -1,6 +1,9 @@
 //! sp1200-rs: native Rust + SDL2 port of the SP-1200 drum machine.
 //!
 //! - No args: launch the playable faceplate UI.
+//! - `--tape file.wav`: load a tape at startup (also: drop a .wav on the window).
+//! - `--project file.json`: load a project at startup (.sp1200.json = web
+//!   import, otherwise the native format; also via drag-and-drop).
 //! - `--render out.wav [seconds]`: render the fixed demo pattern to WAV
 //!   (deterministic; used by the byte-parity test against the JS core).
 //! - `--shot out.bmp`: render one UI frame offscreen to BMP (headless check).
@@ -10,7 +13,9 @@
 mod audio;
 mod dsp;
 mod engine;
+mod project;
 mod ui;
+mod wav;
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -74,8 +79,20 @@ fn cmd_render(out: &str, seconds: Option<f64>) -> i32 {
     }
 }
 
-fn cmd_shot(out: &str) -> i32 {
+fn cmd_shot(out: &str, tape: Option<&str>, project: Option<&str>) -> i32 {
     let mut eng = Engine::new();
+    if let Some(p) = project {
+        if let Err(e) = project::load_project_file(&mut eng, p) {
+            eprintln!("{e}");
+            return 1;
+        }
+    }
+    if let Some(t) = tape {
+        if let Err(e) = engine::load_tape_file(&mut eng, t) {
+            eprintln!("{e}");
+            return 1;
+        }
+    }
     eng.play();
     let mut warm = vec![0.0f32; 20000];
     eng.render(&mut warm);
@@ -103,12 +120,11 @@ fn cmd_shot(out: &str) -> i32 {
     }
 }
 
-fn run_app() -> i32 {
-    run_app_for(None)
-}
-
-/// Like [`run_app`], but exits 0 after `secs` seconds (headless smoke test).
-fn run_app_for(smoke_secs: Option<f64>) -> i32 {
+/// Run the faceplate UI. `smoke_secs` exits 0 after N seconds (headless
+/// smoke test); `tape`/`project` are optional startup loads
+/// (--tape/--project) — the project loads first so its chop markers apply
+/// to the tape.
+fn run_app_for(smoke_secs: Option<f64>, tape: Option<String>, project: Option<String>) -> i32 {
     let sdl = match sdl2::init() {
         Ok(s) => s,
         Err(e) => {
@@ -155,6 +171,32 @@ fn run_app_for(smoke_secs: Option<f64>) -> i32 {
     };
 
     let mut ui = Ui::new();
+    // Startup loads: project first (its chop markers apply to the tape).
+    if let Some(p) = project {
+        match project::load_project_file(&mut engine.lock().unwrap(), &p) {
+            Ok(m) => {
+                println!("{m}");
+                ui.project_path = Some(p);
+                ui.say(m);
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                ui.say_err(e);
+            }
+        }
+    }
+    if let Some(t) = tape {
+        match engine::load_tape_file(&mut engine.lock().unwrap(), &t) {
+            Ok(m) => {
+                println!("{m}");
+                ui.say(m);
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                ui.say_err(e);
+            }
+        }
+    }
     let mut pump = match sdl.event_pump() {
         Ok(p) => p,
         Err(e) => {
@@ -162,7 +204,7 @@ fn run_app_for(smoke_secs: Option<f64>) -> i32 {
             return 1;
         }
     };
-    println!("SP-1200 RS — SPACE play/stop, 1-8 pads, F1-F3 presets, ESC quit");
+    println!("SP-1200 RS — SPACE play/stop, 1-8 pads, F1-F3 presets, S/E splice, W save, ESC quit");
     let t0 = std::time::Instant::now();
     'run: loop {
         if let Some(secs) = smoke_secs {
@@ -188,45 +230,82 @@ fn run_app_for(smoke_secs: Option<f64>) -> i32 {
     0
 }
 
+fn print_help() {
+    println!("sp1200-rs — SP-1200 drum machine (Rust + SDL2)");
+    println!("  sp1200-rs                  launch the faceplate UI");
+    println!("  sp1200-rs --tape file.wav  load a tape at startup");
+    println!("  sp1200-rs --project f.json load a project (.sp1200.json = web import)");
+    println!("  sp1200-rs --render out.wav [seconds]");
+    println!("                             render the fixed demo pattern to WAV");
+    println!("  sp1200-rs --shot out.bmp   render one UI frame offscreen to BMP");
+    println!("  sp1200-rs --smoke [secs]   run the UI headless for N seconds, exit 0");
+    println!("keys: SPACE play/stop, T tap tempo, S/E splice, D clear tape, W save project,");
+    println!("      1-8 pads, F1-F3 presets, arrows/comma/period adjust, ESC quit.");
+    println!("      drop a .wav or .json file onto the window to load it.");
+}
+
+fn flag_value(args: &[String], flag: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|p| args.get(p + 1))
+        .filter(|v| !v.starts_with("--"))
+        .cloned()
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let code = match args.get(1).map(|s| s.as_str()) {
-        Some("--render") => {
-            let path = args.get(2).map(|s| s.as_str()).unwrap_or("out.wav");
-            let secs = args.get(3).and_then(|s| s.parse::<f64>().ok());
-            // Allow `--render out.wav 4.8` (path first).
-            if path.starts_with("--") {
-                eprintln!("usage: sp1200-rs --render out.wav [seconds]");
-                1
-            } else {
-                cmd_render(path, secs)
+    let tape = flag_value(&args, "--tape");
+    let project = flag_value(&args, "--project");
+
+    // Exclusive one-shot modes.
+    if let Some(pos) = args.iter().position(|a| a == "--render") {
+        let path = args.get(pos + 1).map(|s| s.as_str()).unwrap_or("out.wav");
+        let secs = args.get(pos + 2).and_then(|s| s.parse::<f64>().ok());
+        if path.starts_with("--") {
+            eprintln!("usage: sp1200-rs --render out.wav [seconds]");
+            std::process::exit(1);
+        }
+        std::process::exit(cmd_render(path, secs));
+    }
+    if let Some(pos) = args.iter().position(|a| a == "--shot") {
+        let raw = args.get(pos + 1).map(|s| s.as_str()).unwrap_or("shot.bmp");
+        let path = if raw.starts_with("--") {
+            "shot.bmp"
+        } else {
+            raw
+        };
+        std::process::exit(cmd_shot(path, tape.as_deref(), project.as_deref()));
+    }
+    // UI / smoke mode with composable flags.
+    let mut smoke: Option<f64> = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--tape" | "--project" => {
+                i += 2; // value already parsed above
+            }
+            "--smoke" => {
+                let v = args.get(i + 1).and_then(|s| s.parse::<f64>().ok());
+                match v {
+                    Some(s) => {
+                        smoke = Some(s);
+                        i += 2;
+                    }
+                    None => {
+                        smoke = Some(3.0);
+                        i += 1;
+                    }
+                }
+            }
+            "--help" | "-h" => {
+                print_help();
+                std::process::exit(0);
+            }
+            other => {
+                eprintln!("unknown arg: {other} (try --help)");
+                std::process::exit(1);
             }
         }
-        Some("--shot") => {
-            let path = args.get(2).map(|s| s.as_str()).unwrap_or("shot.bmp");
-            cmd_shot(path)
-        }
-        Some("--smoke") => {
-            let secs = args
-                .get(2)
-                .and_then(|s| s.parse::<f64>().ok())
-                .unwrap_or(3.0);
-            run_app_for(Some(secs))
-        }
-        Some("--help") | Some("-h") => {
-            println!("sp1200-rs — SP-1200 drum machine (Rust + SDL2)");
-            println!("  sp1200-rs                  launch the faceplate UI");
-            println!("  sp1200-rs --render out.wav [seconds]");
-            println!("                             render the fixed demo pattern to WAV");
-            println!("  sp1200-rs --shot out.bmp   render one UI frame offscreen to BMP");
-            println!("  sp1200-rs --smoke [secs]   run the UI headless for N seconds, exit 0");
-            0
-        }
-        Some(other) => {
-            eprintln!("unknown arg: {other} (try --help)");
-            1
-        }
-        None => run_app(),
-    };
-    std::process::exit(code);
+    }
+    std::process::exit(run_app_for(smoke, tape, project));
 }
