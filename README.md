@@ -50,6 +50,8 @@ time).
 | Drop a `.wav` | Load it as the tape (through the 12-bit path, auto-spliced) |
 | Drop a `.json` | Load a project (`.sp1200.json` = web import, otherwise native) |
 | `Tab` | Toggle the sample editor for the selected pad |
+| `P` | Panic — kill all sounding voices immediately |
+| `K` | Lock/unlock the selected pad: locked pads keep their sample while tapes are loaded, spliced, or cleared (a small square marks them) |
 | `Esc` / `Q` | Quit |
 
 ## Sample editor (`Tab`)

@@ -263,11 +263,12 @@ fn print_help() {
     println!("                             render the fixed demo pattern to WAV");
     println!("  sp1200-rs --shot out.bmp   render one UI frame offscreen to BMP");
     println!("  sp1200-rs --smoke [secs]   run the UI headless for N seconds, exit 0");
-    println!("keys: SPACE play/stop, T tap tempo, TAB sample editor, S/E splice, D clear tape,");
+    println!("keys: SPACE play/stop, T tap tempo, TAB sample editor, P panic, K lock pad,");
+    println!("      S/E splice, D clear tape, W save project, 1-8 pads, F1-F3 presets,");
+    println!("      arrows/comma/period adjust, ESC quit.");
     println!(
-        "      W save project, 1-8 pads, F1-F3 presets, arrows/comma/period adjust, ESC quit."
+        "      editor: Z/X C/V trim, R reverse, N normalize, B browse, G choke, F filter, K lock."
     );
-    println!("      editor: Z/X C/V trim, R reverse, N normalize, B browse, G choke, F filter.");
     println!("      drop a .wav/.mp3 or .json file onto the window to load it.");
 }
 

@@ -45,6 +45,9 @@ pub struct Pad {
     /// Non-destructive edit region, fractions of `source`.
     pub trim: (f32, f32),
     pub reverse: bool,
+    /// Pinned: tape load/splice/clear won't replace this pad's sample.
+    /// Explicit per-pad actions (browser load, edits) still apply.
+    pub locked: bool,
 }
 
 impl Pad {
@@ -64,6 +67,7 @@ impl Pad {
             choke: 0,
             trim: (0.0, 1.0),
             reverse: false,
+            locked: false,
         }
     }
 
@@ -248,6 +252,27 @@ impl Engine {
         self.pad_hit_at[pad] = self.clock;
     }
 
+    /// Panic: silence every voice immediately. The transport keeps its
+    /// state — the next scheduled step will sound again.
+    pub fn panic(&mut self) {
+        for v in self.voices.iter_mut() {
+            v.active = false;
+        }
+    }
+
+    /// Number of currently sounding voices (tests).
+    #[cfg(test)]
+    pub fn active_voices(&self) -> usize {
+        self.voices.iter().filter(|v| v.active).count()
+    }
+
+    /// Pin/unpin a pad against tape load/splice/clear.
+    pub fn set_locked(&mut self, i: usize, locked: bool) {
+        if i < N_PADS {
+            self.pads[i].locked = locked;
+        }
+    }
+
     pub fn play(&mut self) {
         self.playing = true;
         self.pattern_start = self.clock;
@@ -301,7 +326,11 @@ impl Engine {
                 None => fallback(),
             }
         };
-        self.chop_map = [None; N_PADS];
+        for i in 0..N_PADS {
+            if !self.pads[i].locked {
+                self.chop_map[i] = None;
+            }
+        }
         self.tape = Some(Tape { name, audio, chops });
         self.refresh_pad_samples();
         self.tape.as_ref().map(|t| t.chops.len()).unwrap_or(0)
@@ -368,6 +397,9 @@ impl Engine {
             })
             .collect();
         for (i, (s, m)) in resolved.into_iter().enumerate() {
+            if self.pads[i].locked {
+                continue;
+            }
             self.pads[i].source = s;
             self.pads[i].rebuild();
             self.chop_map[i] = m;
@@ -413,6 +445,7 @@ impl Engine {
         self.pad_factory[i] = audio.clone();
         self.pads[i].custom = true;
         self.pads[i].set_source(audio, Some(label.clone()));
+        self.chop_map[i] = None; // explicit load: this pad plays the file
         Ok(format!("PAD {} <- {label} ({n} SAMPLES)", i + 1))
     }
 
@@ -737,6 +770,100 @@ pub fn load_tape_file(eng: &mut Engine, path: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panic_kills_all_voices_keeps_transport() {
+        let mut e = Engine::new();
+        e.play();
+        for i in 0..N_PADS {
+            e.trigger(i);
+        }
+        assert!(e.voices.iter().any(|v| v.active));
+        e.panic();
+        assert!(e.voices.iter().all(|v| !v.active));
+        assert!(e.playing); // transport untouched
+                            // New triggers still work after a panic.
+        e.trigger(0);
+        assert!(e.voices.iter().any(|v| v.active));
+    }
+
+    #[test]
+    fn locked_pad_survives_tape_load_splice_clear() {
+        let mut e = Engine::new();
+        let drum0 = e.pads[0].source.clone();
+        e.set_locked(0, true);
+        // Tape load: unlocked pads get chops, locked pad keeps its drum.
+        let mut tape = Vec::new();
+        for _ in 0..4 {
+            tape.push(2047);
+            tape.extend(std::iter::repeat(300i16).take(3000));
+        }
+        e.load_tape("T".to_string(), tape);
+        assert_eq!(e.pads[0].source, drum0);
+        assert_eq!(e.pad_label(0), "KICK");
+        assert_eq!(e.pad_label(1), "CHOP 2"); // pad 2 plays chop 2
+                                              // Splice: locked pad still untouched.
+        e.splice_equal();
+        assert_eq!(e.pads[0].source, drum0);
+        // Clear: locked pad keeps its sample instead of reverting.
+        e.clear_tape();
+        assert_eq!(e.pads[0].source, drum0);
+        assert!(e.tape.is_none());
+        // Unlock and reload: now it takes the chop like everyone else.
+        e.set_locked(0, false);
+        let mut tape = Vec::new();
+        for _ in 0..4 {
+            tape.push(2047);
+            tape.extend(std::iter::repeat(300i16).take(3000));
+        }
+        e.load_tape("T2".to_string(), tape);
+        assert_eq!(e.pad_label(0), "CHOP 1");
+    }
+
+    #[test]
+    fn locked_chop_pad_keeps_chop_across_tape_swap() {
+        let mut e = Engine::new();
+        let mut tape = Vec::new();
+        for _ in 0..4 {
+            tape.push(2047);
+            tape.extend(std::iter::repeat(300i16).take(3000));
+        }
+        e.load_tape("A".to_string(), tape);
+        let chop_src = e.pads[2].source.clone();
+        e.set_locked(2, true);
+        // New tape: locked pad keeps the OLD chop audio.
+        let mut tape2 = Vec::new();
+        for _ in 0..8 {
+            tape2.push(2047);
+            tape2.extend(std::iter::repeat(900i16).take(2000));
+        }
+        e.load_tape("B".to_string(), tape2);
+        assert_eq!(e.pads[2].source, chop_src);
+        assert_eq!(e.pad_label(2), "CHOP 3"); // old chop index preserved
+        assert_eq!(e.pad_label(0), "CHOP 1"); // unlocked pads follow the new tape
+    }
+
+    #[test]
+    fn explicit_pad_load_overrides_but_keeps_lock() {
+        let mut e = Engine::new();
+        e.set_locked(1, true);
+        let custom = vec![777i16; 300];
+        // Simulate an explicit browser load via set_source path.
+        e.pad_factory[1] = custom.clone();
+        e.pads[1].custom = true;
+        e.pads[1].set_source(custom.clone(), Some("MINE".to_string()));
+        e.chop_map[1] = None;
+        assert_eq!(e.pads[1].source, custom);
+        assert!(e.pads[1].locked); // still pinned against future tapes
+                                   // ...which a later tape load then respects.
+        let mut tape = Vec::new();
+        for _ in 0..4 {
+            tape.push(2047);
+            tape.extend(std::iter::repeat(300i16).take(3000));
+        }
+        e.load_tape("T".to_string(), tape);
+        assert_eq!(e.pads[1].source, custom);
+    }
 
     #[test]
     fn choke_group_kills_same_group_voices() {

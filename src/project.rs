@@ -139,6 +139,8 @@ pub struct NativePad {
     pub trim: [f32; 2],
     #[serde(default)]
     pub reverse: bool,
+    #[serde(default)]
+    pub locked: bool,
     /// User-loaded sample (base64 LE i16, full source); absent for drums.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sample: Option<String>,
@@ -210,7 +212,8 @@ pub fn apply_native(eng: &mut Engine, p: &NativeProject) {
     for (i, pad) in p.pads.iter().enumerate() {
         eng.pads[i].tune_st = pad.tune.clamp(-24.0, 24.0);
         eng.pads[i].level = pad.level.clamp(0.0, 1.0);
-        // User sample first (becomes the drum-mode source), then edits.
+        eng.pads[i].locked = false; // restored from the file below
+                                    // User sample first (becomes the drum-mode source), then edits.
         if let Some(b64) = &pad.sample {
             if let Ok(bytes) = b64_decode(b64) {
                 if bytes.len() % 2 == 0 && !bytes.is_empty() {
@@ -232,6 +235,7 @@ pub fn apply_native(eng: &mut Engine, p: &NativeProject) {
         eng.pads[i].rebuild();
         eng.set_filter(i, FilterKind::from_str(&pad.filter), pad.cutoff);
         eng.set_choke(i, pad.choke);
+        eng.pads[i].locked = pad.locked;
     }
     eng.patterns = p.pattern;
     match &p.tape {
@@ -282,6 +286,7 @@ pub fn save_native(eng: &Engine, name: &str) -> String {
             choke: p.choke,
             trim: [p.trim.0, p.trim.1],
             reverse: p.reverse,
+            locked: p.locked,
             sample: if p.custom {
                 Some(pcm16_b64_encode(&p.source))
             } else {
@@ -625,6 +630,7 @@ mod tests {
         e.toggle_reverse(1);
         e.pads[6].set_source(vec![11i16, -22, 33, -44], Some("WOBBLE".to_string()));
         e.pads[6].custom = true;
+        e.set_locked(3, true);
         let json = save_native(&e, "design");
         assert!(json.contains("\"filter\": \"lp\""), "{json}");
         let p = parse_native(&json).unwrap();
@@ -635,6 +641,8 @@ mod tests {
         assert_eq!(e2.pads[5].filter_kind, FilterKind::Highpass);
         assert_eq!(e2.pads[4].choke, 2);
         assert_eq!(e2.pads[5].choke, 2);
+        assert!(e2.pads[3].locked);
+        assert!(!e2.pads[0].locked);
         assert!((e2.pads[1].trim.0 - 0.25).abs() < 1e-6);
         assert!(e2.pads[1].reverse);
         // Reversed trim: playable is the flipped region.

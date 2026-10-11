@@ -406,6 +406,20 @@ pub fn handle_event(ui: &mut Ui, eng: &mut Engine, ev: &Event) -> bool {
                     eng.clear_tape();
                     ui.say("TAPE CLEARED");
                 }
+                Keycode::P => {
+                    eng.panic();
+                    ui.say("PANIC - ALL VOICES KILLED");
+                }
+                Keycode::K => {
+                    let i = ui.selected_pad;
+                    let locked = !eng.pads[i].locked;
+                    eng.set_locked(i, locked);
+                    ui.say(format!(
+                        "PAD {} {}",
+                        i + 1,
+                        if locked { "LOCKED" } else { "UNLOCKED" }
+                    ));
+                }
                 Keycode::W => {
                     let path = ui
                         .project_path
@@ -600,6 +614,9 @@ pub fn draw(p: &mut dyn Painter, ui: &Ui, eng: &Engine) {
         }
         let key = format!("{}", i + 1);
         p.text(x + 10, y + 10, &key, 1, DIM);
+        if eng.pads[i].locked {
+            p.rect(x + w as i32 - 18, y + 8, 10, 10, TEXT);
+        }
     }
 
     // steps
@@ -646,7 +663,7 @@ pub fn draw(p: &mut dyn Painter, ui: &Ui, eng: &Engine) {
     p.text(
         24,
         584,
-        "SPACE PLAY/STOP  T TAP  TAB SAMPLE EDIT  S/E SPLICE  D TAPE OFF  W SAVE  </> SWING  UP/DN MASTER  ,/. BPM  ESC QUIT",
+        "SPACE PLAY/STOP  T TAP  TAB EDIT  P PANIC  K LOCK  S/E SPLICE  D TAPE OFF  W SAVE  ESC QUIT",
         1,
         DIM,
     );
@@ -740,6 +757,7 @@ fn draw_edit(p: &mut dyn Painter, ui: &Ui, eng: &Engine) {
                 format!("G{}", pad.choke)
             }
         ),
+        format!("LOCK {}", if pad.locked { "ON" } else { "OFF" }),
     ];
     for (r, s) in left.iter().enumerate() {
         p.text(24, y0 + r as i32 * 24, s, 1, TEXT);
@@ -788,7 +806,7 @@ fn draw_edit(p: &mut dyn Painter, ui: &Ui, eng: &Engine) {
     p.text(
         24,
         606,
-        "B BROWSE SAMPLES  G CHOKE GROUP  F FILTER  UP/DN CUTOFF  1-8 SELECT+PLAY",
+        "B BROWSE  G CHOKE  F FILTER  K LOCK  UP/DN CUTOFF  1-8 SELECT+PLAY",
         1,
         DIM,
     );
@@ -919,6 +937,47 @@ mod tests {
         assert!(eng.pads[2].custom);
         assert!(!eng.pads[2].source.is_empty());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn panic_and_lock_keys() {
+        let mut eng = Engine::new();
+        let mut ui = Ui::new();
+        let key = |kc| Event::KeyDown {
+            timestamp: 0,
+            window_id: 0,
+            keycode: Some(kc),
+            scancode: None,
+            keymod: sdl2::keyboard::Mod::NOMOD,
+            repeat: false,
+        };
+        // P kills voices on either page.
+        eng.trigger(0);
+        eng.trigger(3);
+        assert!(eng.active_voices() > 0);
+        handle_event(&mut ui, &mut eng, &key(Keycode::P));
+        assert_eq!(eng.active_voices(), 0);
+        // K toggles the lock on the selected pad.
+        assert!(!eng.pads[0].locked);
+        handle_event(&mut ui, &mut eng, &key(Keycode::K));
+        assert!(eng.pads[0].locked);
+        handle_event(&mut ui, &mut eng, &key(Keycode::K));
+        assert!(!eng.pads[0].locked);
+        // Same on the edit page.
+        ui.page = Page::Edit;
+        handle_event(&mut ui, &mut eng, &key(Keycode::K));
+        assert!(eng.pads[0].locked);
+        // Draw both pages with a locked pad: no panic.
+        let mut surf = Surface::new(W, H, PixelFormatEnum::RGB24).unwrap();
+        {
+            let p: &mut dyn Painter = &mut surf;
+            draw(p, &ui, &eng);
+        }
+        ui.page = Page::Pads;
+        {
+            let p: &mut dyn Painter = &mut surf;
+            draw(p, &ui, &eng);
+        }
     }
 
     #[test]
