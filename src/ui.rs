@@ -36,6 +36,7 @@ const STEP_OFF: (u8, u8, u8) = (36, 29, 22);
 const PLAYHEAD: (u8, u8, u8) = (255, 96, 64);
 const SEL: (u8, u8, u8) = (255, 157, 46);
 const REC: (u8, u8, u8) = (255, 64, 48);
+const LOOPC: (u8, u8, u8) = (255, 190, 80);
 
 // ---------- 5x7 bitmap font ----------
 
@@ -416,6 +417,11 @@ pub fn handle_event(ui: &mut Ui, eng: &mut Engine, ev: &Event) -> bool {
                     }
                     Keycode::S => {
                         let m = ft.stop_rewind();
+                        ui.say(m);
+                        true
+                    }
+                    Keycode::L => {
+                        let m = ft.toggle_loop();
                         ui.say(m);
                         true
                     }
@@ -817,6 +823,16 @@ fn draw_tape(p: &mut dyn Painter, ui: &Ui, eng: &Engine) {
         p.text(rx, 26, s, 2, c);
         rx -= 24;
     }
+    if ft.loop_enabled {
+        let ls = if ft.loop_len > 0 {
+            format!("LOOP {:.1}S", ft.loop_len_secs())
+        } else {
+            "LOOP".to_string()
+        };
+        let w = text_w(&ls, 2) as i32;
+        rx -= w;
+        p.text(rx, 26, &ls, 2, LOOPC);
+    }
 
     // Track strips.
     for t in 0..N_TRACKS {
@@ -901,7 +917,7 @@ fn draw_tape(p: &mut dyn Painter, ui: &Ui, eng: &Engine) {
     p.text(
         24,
         602,
-        "ENTER PLAY/STOP  R RECORD  S REWIND  SPACE PATTERN  TAB PADS",
+        "ENTER PLAY/STOP  R RECORD  S REWIND  L LOOP  SPACE PATTERN  TAB PADS",
         1,
         DIM,
     );
@@ -1215,6 +1231,13 @@ mod tests {
         handle_event(&mut ui, &mut eng, &key(Keycode::S));
         assert!(!eng.four_track.playing);
         assert_eq!(eng.four_track.playhead, 0);
+        // L toggles the tape loop.
+        eng.four_track.tracks[0].samples = vec![0.2; 300];
+        handle_event(&mut ui, &mut eng, &key(Keycode::L));
+        assert!(eng.four_track.loop_enabled);
+        assert_eq!(eng.four_track.loop_len, 300);
+        handle_event(&mut ui, &mut eng, &key(Keycode::L));
+        assert!(!eng.four_track.loop_enabled);
         // X clears the selected track.
         eng.four_track.tracks[2].samples = vec![0.1; 10];
         handle_event(&mut ui, &mut eng, &key(Keycode::X));

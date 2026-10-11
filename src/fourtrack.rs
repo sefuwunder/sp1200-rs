@@ -82,6 +82,12 @@ pub struct FourTrack {
     pub playhead: usize,
     pub playing: bool,
     pub recording: bool,
+    /// Loop the tape instead of stopping at the end.
+    pub loop_enabled: bool,
+    /// Loop length in samples. Tracks the longest track while not
+    /// recording; frozen when recording starts so a first take can
+    /// define its own length and overdubs wrap around existing material.
+    pub loop_len: usize,
 }
 
 impl FourTrack {
@@ -92,6 +98,8 @@ impl FourTrack {
             playhead: 0,
             playing: false,
             recording: false,
+            loop_enabled: false,
+            loop_len: 0,
         }
     }
 
@@ -138,6 +146,9 @@ impl FourTrack {
         if !self.playing {
             self.recording = false;
         }
+        if self.playing && !self.recording {
+            self.loop_len = self.longest();
+        }
         if self.playing {
             "TAPE PLAY".to_string()
         } else {
@@ -145,9 +156,34 @@ impl FourTrack {
         }
     }
 
+    pub fn toggle_loop(&mut self) -> String {
+        self.loop_enabled = !self.loop_enabled;
+        if self.loop_enabled {
+            if !self.recording {
+                self.loop_len = self.longest();
+            }
+            if self.loop_len == 0 {
+                "LOOP ON".to_string()
+            } else {
+                format!("LOOP ON {:.1}S", self.loop_len_secs())
+            }
+        } else {
+            "LOOP OFF".to_string()
+        }
+    }
+
+    pub fn longest(&self) -> usize {
+        self.tracks.iter().map(|t| t.samples.len()).max().unwrap_or(0)
+    }
+
+    pub fn loop_len_secs(&self) -> f32 {
+        self.loop_len as f32 / SP_RATE as f32
+    }
+
     pub fn toggle_record(&mut self) -> Result<String, String> {
         if self.recording {
             self.recording = false;
+            self.loop_len = self.longest();
             return Ok("REC STOP - TAKE KEPT".to_string());
         }
         if !self.tracks.iter().any(|t| t.armed) {
@@ -180,68 +216,82 @@ impl FourTrack {
     /// `input`: the resampled capture block (empty = silence when no
     /// device). `master`: the voice/pattern mix for this block, or `None`
     /// when no MASTER-armed track is recording.
+    ///
+    /// When looping, the block is split at the loop boundary so the
+    /// playhead wraps mid-block with no dropout; a recording take wraps
+    /// too, punching in around the loop.
     pub fn process(&mut self, out: &mut [f32], input: &[f32], master: Option<&[f32]>) {
         if !self.playing && !self.recording {
             return;
         }
         let n = out.len();
-        if self.playing {
-            let recording = self.recording;
-            let playhead = self.playhead;
-            for t in self.tracks.iter() {
-                if t.muted || t.samples.is_empty() {
-                    continue;
-                }
-                if recording && t.armed {
-                    continue; // punch-in: monitor the input instead
-                }
-                if playhead < t.samples.len() {
-                    let avail = (t.samples.len() - playhead).min(n);
-                    for i in 0..avail {
-                        out[i] += t.samples[playhead + i];
+        let recording = self.recording;
+        let playing = self.playing;
+        if !recording {
+            self.loop_len = self.longest();
+        }
+        let loop_on = self.loop_enabled && self.loop_len > 0;
+        let loop_len = self.loop_len;
+
+        let mut off = 0;
+        let mut pos = self.playhead;
+        while off < n {
+            if loop_on && pos >= loop_len {
+                pos = 0;
+            }
+            // One segment: up to the loop end, or the rest of the block.
+            let seg = if loop_on { (loop_len - pos).min(n - off) } else { n - off };
+
+            if playing {
+                for t in self.tracks.iter() {
+                    if t.muted || t.samples.is_empty() {
+                        continue;
+                    }
+                    if recording && t.armed {
+                        continue; // punch-in: monitor the input instead
+                    }
+                    if pos < t.samples.len() {
+                        let avail = (t.samples.len() - pos).min(seg);
+                        for i in 0..avail {
+                            out[off + i] += t.samples[pos + i];
+                        }
                     }
                 }
             }
-        }
-        if self.recording {
-            let playhead = self.playhead;
-            let mut monitoring_input = false;
-            for t in self.tracks.iter_mut() {
-                if !t.armed {
-                    continue;
-                }
-                let src: &[f32] = match t.source {
-                    TrackSource::Input => {
-                        monitoring_input = true;
-                        input
+            if recording {
+                let mut monitoring_input = false;
+                for t in self.tracks.iter_mut() {
+                    if !t.armed {
+                        continue;
                     }
-                    TrackSource::Master => master.unwrap_or(&[]),
-                };
-                if t.samples.len() < playhead + n {
-                    t.samples.resize(playhead + n, 0.0);
+                    let src: &[f32] = match t.source {
+                        TrackSource::Input => {
+                            monitoring_input = true;
+                            input
+                        }
+                        TrackSource::Master => master.unwrap_or(&[]),
+                    };
+                    if t.samples.len() < pos + seg {
+                        t.samples.resize(pos + seg, 0.0);
+                    }
+                    for i in 0..seg {
+                        t.samples[pos + i] = src.get(off + i).copied().unwrap_or(0.0);
+                    }
                 }
-                for i in 0..n {
-                    t.samples[playhead + i] = src.get(i).copied().unwrap_or(0.0);
+                // Monitor live input while recording it.
+                if monitoring_input {
+                    for i in 0..seg {
+                        out[off + i] += input.get(off + i).copied().unwrap_or(0.0);
+                    }
                 }
             }
-            // Monitor live input while recording it.
-            if monitoring_input {
-                for i in 0..n {
-                    out[i] += input.get(i).copied().unwrap_or(0.0);
-                }
-            }
+            off += seg;
+            pos += seg;
         }
-        self.playhead += n;
-        if self.playing && !self.recording {
-            let longest = self
-                .tracks
-                .iter()
-                .map(|t| t.samples.len())
-                .max()
-                .unwrap_or(0);
-            if self.playhead >= longest {
-                self.playing = false;
-            }
+        self.playhead = pos;
+
+        if !loop_on && playing && !recording && self.playhead >= self.longest() {
+            self.playing = false;
         }
     }
 }
@@ -337,6 +387,79 @@ mod tests {
         let mut ft = FourTrack::new();
         assert!(ft.toggle_record().is_err());
         assert!(!ft.recording);
+    }
+
+    #[test]
+    fn loop_wraps_playback_without_dropout() {
+        let mut ft = FourTrack::new();
+        // Distinctive ramp so wrap-around is detectable in the output.
+        ft.tracks[0].samples = (0..300).map(|i| i as f32 / 300.0).collect();
+        ft.toggle_loop();
+        assert!(ft.loop_enabled);
+        assert_eq!(ft.loop_len, 300);
+        ft.toggle_play();
+        // Two passes over the loop with a block size that straddles the
+        // boundary: output must equal the ramp repeated, sample-exact.
+        let mut out = vec![0.0f32; 700];
+        ft.process(&mut out, &[], None);
+        for i in 0..700 {
+            let want = (i % 300) as f32 / 300.0;
+            assert!((out[i] - want).abs() < 1e-6, "i={i}");
+        }
+        assert!(ft.playing, "looping never auto-stops");
+        assert_eq!(ft.playhead, 100);
+    }
+
+    #[test]
+    fn loop_record_overdubs_around() {
+        let mut ft = FourTrack::new();
+        ft.tracks[0].samples = vec![0.5; 300];
+        ft.toggle_arm();
+        ft.toggle_loop();
+        assert_eq!(ft.loop_len, 300);
+        ft.toggle_record().unwrap();
+        // Record 400 samples of 0.1: wraps at 300, keeps punching in.
+        let m = master_block(400, 0.1);
+        let mut out = vec![0.0f32; 400];
+        ft.process(&mut out, &[], Some(&m));
+        assert_eq!(ft.playhead, 100);
+        assert_eq!(ft.tracks[0].samples.len(), 300, "take does not grow past the loop");
+        assert!(ft.tracks[0].samples.iter().all(|&s| (s - 0.1).abs() < 1e-6));
+    }
+
+    #[test]
+    fn loop_len_frozen_while_recording_first_take() {
+        let mut ft = FourTrack::new();
+        ft.toggle_arm();
+        ft.toggle_loop(); // no audio yet: loop armed but length 0
+        assert_eq!(ft.loop_len, 0);
+        ft.toggle_record().unwrap();
+        // First take records linearly, no wrap.
+        for _ in 0..3 {
+            let m = master_block(100, 0.5);
+            let mut out = vec![0.0f32; 100];
+            ft.process(&mut out, &[], Some(&m));
+        }
+        assert_eq!(ft.tracks[0].samples.len(), 300);
+        assert_eq!(ft.playhead, 300);
+        ft.toggle_record().unwrap(); // stop; still playing -> loop picks up the take
+        assert_eq!(ft.loop_len, 300);
+        assert!(ft.playing);
+        let mut out = vec![0.0f32; 100];
+        ft.process(&mut out, &[], None);
+        assert!(out.iter().all(|&s| (s - 0.5).abs() < 1e-6), "loops the fresh take");
+        assert!(ft.playing);
+    }
+
+    #[test]
+    fn loop_toggle_captures_current_longest() {
+        let mut ft = FourTrack::new();
+        ft.tracks[0].samples = vec![0.5; 150];
+        ft.tracks[1].samples = vec![0.5; 400];
+        ft.toggle_loop();
+        assert_eq!(ft.loop_len, 400);
+        ft.toggle_loop();
+        assert!(!ft.loop_enabled);
     }
 
     #[test]

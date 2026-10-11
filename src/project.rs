@@ -228,6 +228,9 @@ pub struct NativeProject {
     /// 4-track tape; empty in older files.
     #[serde(default)]
     pub four_track: Vec<NativeTrack>,
+    /// 4-track loop toggle; off in older files.
+    #[serde(default)]
+    pub four_track_loop: bool,
 }
 
 fn def_bpm() -> f64 {
@@ -317,6 +320,8 @@ pub fn apply_native(eng: &mut Engine, p: &NativeProject) {
         ft.playing = false;
         ft.recording = false;
         ft.selected = 0;
+        ft.loop_enabled = p.four_track_loop;
+        ft.loop_len = 0;
     }
     match &p.tape {
         Some(t) => {
@@ -406,6 +411,7 @@ pub fn save_native(eng: &Engine, name: &str) -> String {
         pattern: eng.patterns,
         tape,
         four_track,
+        four_track_loop: eng.four_track.loop_enabled,
     };
     serde_json::to_string_pretty(&p).unwrap_or_else(|_| "{}".to_string())
 }
@@ -745,6 +751,7 @@ mod tests {
         e.four_track.toggle_mute();
         e.four_track.toggle_source(); // -> INPUT
         e.four_track.stop_rewind();
+        e.four_track.toggle_loop();
         let json = save_native(&e, "design");
         assert!(json.contains("\"filter\": \"lp\""), "{json}");
         let p = parse_native(&json).unwrap();
@@ -757,6 +764,7 @@ mod tests {
         assert!(!e2.pads[0].mono);
         // 4-track round-trips (audio + settings).
         assert_eq!(e2.four_track.tracks[0].samples, take);
+        assert!(e2.four_track.loop_enabled, "loop toggle round-trips");
         assert!(e2.four_track.tracks[0].armed);
         assert!(e2.four_track.tracks[1].muted);
         assert_eq!(
