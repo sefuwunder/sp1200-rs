@@ -92,6 +92,33 @@ pub fn pcm16_b64_to_f32(b64: &str) -> Result<Vec<f32>, String> {
         .collect())
 }
 
+/// base64 of little-endian i16 → String (for embedding pad samples).
+pub fn pcm16_b64_encode(samples: &[i16]) -> String {
+    let mut bytes = Vec::with_capacity(samples.len() * 2);
+    for s in samples {
+        bytes.extend_from_slice(&s.to_le_bytes());
+    }
+    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    for ch in bytes.chunks(3) {
+        let n = (ch[0] as u32) << 16
+            | (*ch.get(1).unwrap_or(&0) as u32) << 8
+            | (*ch.get(2).unwrap_or(&0) as u32);
+        out.push(B64ABC[(n >> 18) as usize & 63] as char);
+        out.push(B64ABC[(n >> 12) as usize & 63] as char);
+        out.push(if ch.len() > 1 {
+            B64ABC[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if ch.len() > 2 {
+            B64ABC[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 // ---------- native format ----------
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -100,6 +127,29 @@ pub struct NativePad {
     pub level: f32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chop: Option<usize>, // chop this pad plays; default = pad index
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub filter: String, // "off" | "lp" | "hp"
+    #[serde(default = "def_cutoff")]
+    pub cutoff: f32,
+    #[serde(default)]
+    pub choke: u8, // 0 = none
+    #[serde(default = "def_trim")]
+    pub trim: [f32; 2],
+    #[serde(default)]
+    pub reverse: bool,
+    /// User-loaded sample (base64 LE i16, full source); absent for drums.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample: Option<String>,
+}
+
+fn def_cutoff() -> f32 {
+    3000.0
+}
+
+fn def_trim() -> [f32; 2] {
+    [0.0, 1.0]
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -153,12 +203,35 @@ pub fn parse_native(json: &str) -> Result<NativeProject, String> {
 
 /// Apply a parsed native project. Infallible — call only after `parse_native`.
 pub fn apply_native(eng: &mut Engine, p: &NativeProject) {
+    use crate::dsp::FilterKind;
     eng.bpm = p.bpm.clamp(60.0, 200.0);
     eng.swing = p.swing.clamp(50.0, 75.0);
     eng.master = p.master.clamp(0.0, 1.0);
     for (i, pad) in p.pads.iter().enumerate() {
         eng.pads[i].tune_st = pad.tune.clamp(-24.0, 24.0);
         eng.pads[i].level = pad.level.clamp(0.0, 1.0);
+        // User sample first (becomes the drum-mode source), then edits.
+        if let Some(b64) = &pad.sample {
+            if let Ok(bytes) = b64_decode(b64) {
+                if bytes.len() % 2 == 0 && !bytes.is_empty() {
+                    let src: Vec<i16> = bytes
+                        .chunks_exact(2)
+                        .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                        .collect();
+                    eng.set_custom_pad(i, src, pad.label.clone());
+                }
+            }
+        } else if pad.label.is_some() {
+            eng.pads[i].label = pad.label.clone();
+        }
+        eng.pads[i].trim = (pad.trim[0].clamp(0.0, 1.0), pad.trim[1].clamp(0.0, 1.0));
+        if eng.pads[i].trim.1 < eng.pads[i].trim.0 {
+            eng.pads[i].trim.1 = eng.pads[i].trim.0;
+        }
+        eng.pads[i].reverse = pad.reverse;
+        eng.pads[i].rebuild();
+        eng.set_filter(i, FilterKind::from_str(&pad.filter), pad.cutoff);
+        eng.set_choke(i, pad.choke);
     }
     eng.patterns = p.pattern;
     match &p.tape {
@@ -197,10 +270,24 @@ pub fn apply_native(eng: &mut Engine, p: &NativeProject) {
 
 /// Serialize the engine to the native format.
 pub fn save_native(eng: &Engine, name: &str) -> String {
-    let pads: [NativePad; 8] = std::array::from_fn(|i| NativePad {
-        tune: eng.pads[i].tune_st,
-        level: eng.pads[i].level,
-        chop: eng.chop_map[i],
+    let pads: [NativePad; 8] = std::array::from_fn(|i| {
+        let p = &eng.pads[i];
+        NativePad {
+            tune: p.tune_st,
+            level: p.level,
+            chop: eng.chop_map[i],
+            label: p.label.clone(),
+            filter: p.filter_kind.as_str().to_string(),
+            cutoff: p.filter_cutoff,
+            choke: p.choke,
+            trim: [p.trim.0, p.trim.1],
+            reverse: p.reverse,
+            sample: if p.custom {
+                Some(pcm16_b64_encode(&p.source))
+            } else {
+                None
+            },
+        }
     });
     let tape = eng.tape.as_ref().map(|t| NativeTape {
         name: t.name.clone(),
@@ -509,6 +596,80 @@ mod tests {
             chops: vec![(0, 1000), (1000, 2500)],
         });
         e
+    }
+
+    #[test]
+    fn b64_encode_round_trips() {
+        let samples: Vec<i16> = vec![0, 1, -1, 2047, -2048, 32767, -32768, 12345];
+        let enc = pcm16_b64_encode(&samples);
+        let bytes = b64_decode(&enc).unwrap();
+        let back: Vec<i16> = bytes
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert_eq!(back, samples);
+        // Padding shapes: 1 sample = 2 bytes -> one '='; 3 samples = 6 bytes -> none.
+        assert!(pcm16_b64_encode(&[7i16]).ends_with('='));
+        assert!(!pcm16_b64_encode(&[1i16, 2, 3]).ends_with('='));
+    }
+
+    #[test]
+    fn native_round_trip_sound_design() {
+        use crate::dsp::FilterKind;
+        let mut e = Engine::new();
+        e.set_filter(2, FilterKind::Lowpass, 800.0);
+        e.set_filter(5, FilterKind::Highpass, 5000.0);
+        e.set_choke(4, 2);
+        e.set_choke(5, 2);
+        e.nudge_trim(1, 0, 0.25);
+        e.toggle_reverse(1);
+        e.pads[6].set_source(vec![11i16, -22, 33, -44], Some("WOBBLE".to_string()));
+        e.pads[6].custom = true;
+        let json = save_native(&e, "design");
+        assert!(json.contains("\"filter\": \"lp\""), "{json}");
+        let p = parse_native(&json).unwrap();
+        let mut e2 = Engine::new();
+        apply_native(&mut e2, &p);
+        assert_eq!(e2.pads[2].filter_kind, FilterKind::Lowpass);
+        assert!((e2.pads[2].filter_cutoff - 800.0).abs() < 1e-3);
+        assert_eq!(e2.pads[5].filter_kind, FilterKind::Highpass);
+        assert_eq!(e2.pads[4].choke, 2);
+        assert_eq!(e2.pads[5].choke, 2);
+        assert!((e2.pads[1].trim.0 - 0.25).abs() < 1e-6);
+        assert!(e2.pads[1].reverse);
+        // Reversed trim: playable is the flipped region.
+        assert_eq!(e2.pads[1].sample[0], e.pads[1].sample[0]);
+        assert_eq!(e2.pads[6].source, vec![11i16, -22, 33, -44]);
+        assert_eq!(e2.pads[6].label.as_deref(), Some("WOBBLE"));
+        assert!(e2.pads[6].custom);
+        // Untouched pads stay drums.
+        assert_eq!(e2.pads[0].filter_kind, FilterKind::Off);
+        assert_eq!(e2.pads[0].choke, 0);
+        assert!(!e2.pads[0].custom);
+    }
+
+    #[test]
+    fn native_old_file_without_new_fields_loads() {
+        // v1 files predate filter/choke/trim/reverse/sample: defaults apply.
+        let pads: Vec<String> = (0..8)
+            .map(|_| "{\"tune\":0.0,\"level\":0.9}".to_string())
+            .collect();
+        let steps: Vec<String> = (0..8)
+            .map(|_| format!("[{}]", ["false"; 16].join(",")))
+            .collect();
+        let json = format!(
+            "{{\"format\":\"sp1200-rs\",\"version\":1,\"name\":\"old\",\"bpm\":100.0,\"swing\":60.0,\"master\":0.8,\"pads\":[{}],\"pattern\":[{}]}}",
+            pads.join(","),
+            steps.join(",")
+        );
+        let p = parse_native(&json).unwrap();
+        let mut e = Engine::new();
+        apply_native(&mut e, &p);
+        assert_eq!(e.pads[3].filter_kind, crate::dsp::FilterKind::Off);
+        assert_eq!(e.pads[3].choke, 0);
+        assert_eq!(e.pads[3].trim, (0.0, 1.0));
+        assert!(!e.pads[3].reverse);
+        assert!(!e.pads[3].custom);
     }
 
     #[test]

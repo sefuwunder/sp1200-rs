@@ -123,8 +123,14 @@ fn cmd_shot(out: &str, tape: Option<&str>, project: Option<&str>) -> i32 {
 /// Run the faceplate UI. `smoke_secs` exits 0 after N seconds (headless
 /// smoke test); `tape`/`project` are optional startup loads
 /// (--tape/--project) — the project loads first so its chop markers apply
-/// to the tape.
-fn run_app_for(smoke_secs: Option<f64>, tape: Option<String>, project: Option<String>) -> i32 {
+/// to the tape. `pad_loads` are (pad, wav path) pairs from --pad.
+fn run_app_for(
+    smoke_secs: Option<f64>,
+    tape: Option<String>,
+    project: Option<String>,
+    samples_dir: Option<String>,
+    pad_loads: Vec<(usize, String)>,
+) -> i32 {
     let sdl = match sdl2::init() {
         Ok(s) => s,
         Err(e) => {
@@ -171,6 +177,9 @@ fn run_app_for(smoke_secs: Option<f64>, tape: Option<String>, project: Option<St
     };
 
     let mut ui = Ui::new();
+    if let Some(d) = samples_dir {
+        ui.samples_dir = d;
+    }
     // Startup loads: project first (its chop markers apply to the tape).
     if let Some(p) = project {
         match project::load_project_file(&mut engine.lock().unwrap(), &p) {
@@ -187,6 +196,18 @@ fn run_app_for(smoke_secs: Option<f64>, tape: Option<String>, project: Option<St
     }
     if let Some(t) = tape {
         match engine::load_tape_file(&mut engine.lock().unwrap(), &t) {
+            Ok(m) => {
+                println!("{m}");
+                ui.say(m);
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                ui.say_err(e);
+            }
+        }
+    }
+    for (pad, path) in &pad_loads {
+        match engine.lock().unwrap().load_pad_sample(*pad, path) {
             Ok(m) => {
                 println!("{m}");
                 ui.say(m);
@@ -234,13 +255,18 @@ fn print_help() {
     println!("sp1200-rs — SP-1200 drum machine (Rust + SDL2)");
     println!("  sp1200-rs                  launch the faceplate UI");
     println!("  sp1200-rs --tape file.wav  load a tape at startup");
+    println!("  sp1200-rs --pad N file.wav load a WAV onto pad N (1-8) at startup");
+    println!("  sp1200-rs --samples-dir D  sample browser directory (default ./samples)");
     println!("  sp1200-rs --project f.json load a project (.sp1200.json = web import)");
     println!("  sp1200-rs --render out.wav [seconds]");
     println!("                             render the fixed demo pattern to WAV");
     println!("  sp1200-rs --shot out.bmp   render one UI frame offscreen to BMP");
     println!("  sp1200-rs --smoke [secs]   run the UI headless for N seconds, exit 0");
-    println!("keys: SPACE play/stop, T tap tempo, S/E splice, D clear tape, W save project,");
-    println!("      1-8 pads, F1-F3 presets, arrows/comma/period adjust, ESC quit.");
+    println!("keys: SPACE play/stop, T tap tempo, TAB sample editor, S/E splice, D clear tape,");
+    println!(
+        "      W save project, 1-8 pads, F1-F3 presets, arrows/comma/period adjust, ESC quit."
+    );
+    println!("      editor: Z/X C/V trim, R reverse, N normalize, B browse, G choke, F filter.");
     println!("      drop a .wav or .json file onto the window to load it.");
 }
 
@@ -256,6 +282,23 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let tape = flag_value(&args, "--tape");
     let project = flag_value(&args, "--project");
+    let samples_dir = flag_value(&args, "--samples-dir");
+    let mut pad_loads: Vec<(usize, String)> = Vec::new();
+    let mut pi = 0;
+    while pi < args.len() {
+        if args[pi] == "--pad" {
+            if let (Some(n), Some(f)) = (args.get(pi + 1), args.get(pi + 2)) {
+                if let Ok(pad) = n.parse::<usize>() {
+                    if (1..=8).contains(&pad) && !f.starts_with("--") {
+                        pad_loads.push((pad - 1, f.clone()));
+                    }
+                }
+            }
+            pi += 3;
+        } else {
+            pi += 1;
+        }
+    }
 
     // Exclusive one-shot modes.
     if let Some(pos) = args.iter().position(|a| a == "--render") {
@@ -281,8 +324,11 @@ fn main() {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--tape" | "--project" => {
+            "--tape" | "--project" | "--samples-dir" => {
                 i += 2; // value already parsed above
+            }
+            "--pad" => {
+                i += 3; // N and file already parsed above
             }
             "--smoke" => {
                 let v = args.get(i + 1).and_then(|s| s.parse::<f64>().ok());
@@ -307,5 +353,5 @@ fn main() {
             }
         }
     }
-    std::process::exit(run_app_for(smoke, tape, project));
+    std::process::exit(run_app_for(smoke, tape, project, samples_dir, pad_loads));
 }

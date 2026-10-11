@@ -480,9 +480,157 @@ pub fn equal_chops(len: usize) -> Vec<(usize, usize)> {
     (0..8).map(|i| (i * len / 8, (i + 1) * len / 8)).collect()
 }
 
+// ---------- per-pad resonant filters (real-time biquad) ----------
+
+/// Per-pad filter type. `Off` costs nothing in the mixer (not applied).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FilterKind {
+    Off,
+    Lowpass,
+    Highpass,
+}
+
+impl FilterKind {
+    pub fn cycle(self) -> Self {
+        match self {
+            FilterKind::Off => FilterKind::Lowpass,
+            FilterKind::Lowpass => FilterKind::Highpass,
+            FilterKind::Highpass => FilterKind::Off,
+        }
+    }
+
+    pub fn abbrev(self) -> &'static str {
+        match self {
+            FilterKind::Off => "OFF",
+            FilterKind::Lowpass => "LP",
+            FilterKind::Highpass => "HP",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "lp" => FilterKind::Lowpass,
+            "hp" => FilterKind::Highpass,
+            _ => FilterKind::Off,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FilterKind::Off => "off",
+            FilterKind::Lowpass => "lp",
+            FilterKind::Highpass => "hp",
+        }
+    }
+}
+
+/// Biquad coefficients (RBJ cookbook, Q = 0.71): returns (b0,b1,b2),
+/// (a1,a2) with a0 normalized to 1. Cutoff is clamped to a sane range.
+pub fn biquad_coeffs(kind: FilterKind, cutoff_hz: f32, sr: f64) -> ([f32; 3], [f32; 2]) {
+    let cutoff = cutoff_hz.clamp(40.0, 12000.0) as f64;
+    let w0 = 2.0 * PI * cutoff / sr;
+    let q = 0.71;
+    let alpha = w0.sin() / (2.0 * q);
+    let (b0, b1, b2, a0, a1, a2) = match kind {
+        FilterKind::Lowpass => {
+            let b0 = (1.0 - w0.cos()) / 2.0;
+            let b1 = 1.0 - w0.cos();
+            let b2 = (1.0 - w0.cos()) / 2.0;
+            (b0, b1, b2, 1.0 + alpha, -2.0 * w0.cos(), 1.0 - alpha)
+        }
+        FilterKind::Highpass => {
+            let b0 = (1.0 + w0.cos()) / 2.0;
+            let b1 = -(1.0 + w0.cos());
+            let b2 = (1.0 + w0.cos()) / 2.0;
+            (b0, b1, b2, 1.0 + alpha, -2.0 * w0.cos(), 1.0 - alpha)
+        }
+        FilterKind::Off => return ([1.0, 0.0, 0.0], [0.0, 0.0]),
+    };
+    (
+        [(b0 / a0) as f32, (b1 / a0) as f32, (b2 / a0) as f32],
+        [(a1 / a0) as f32, (a2 / a0) as f32],
+    )
+}
+
+/// Direct Form I biquad, one sample. `st` = [x1, x2, y1, y2], updated.
+pub fn apply_biquad(x: f32, st: &mut [f32; 4], b: &[f32; 3], a: &[f32; 2]) -> f32 {
+    let y = b[0] * x + b[1] * st[0] + b[2] * st[1] - a[0] * st[2] - a[1] * st[3];
+    st[1] = st[0];
+    st[0] = x;
+    st[3] = st[2];
+    st[2] = y;
+    y
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn biquad_lowpass_kills_highs_passes_lows() {
+        for kind in [FilterKind::Lowpass, FilterKind::Highpass] {
+            let (b, a) = biquad_coeffs(kind, 1000.0, SP_RATE);
+            for v in b.iter().chain(a.iter()) {
+                assert!(v.is_finite(), "non-finite coeff {v}");
+            }
+        }
+        // 200 Hz sine through a 1 kHz lowpass: barely touched.
+        let (b, a) = biquad_coeffs(FilterKind::Lowpass, 1000.0, SP_RATE);
+        let mut st = [0.0f32; 4];
+        let mut peak = 0.0f32;
+        for n in 0..26040 {
+            let x = (2.0 * PI * 200.0 * n as f64 / SP_RATE).sin() as f32;
+            peak = peak.max(apply_biquad(x, &mut st, &b, &a).abs());
+        }
+        assert!(peak > 0.9, "lowpass ate the lows: {peak}");
+        // 8 kHz sine through the same lowpass: heavily attenuated.
+        let mut st = [0.0f32; 4];
+        let mut peak = 0.0f32;
+        for n in 0..26040 {
+            let x = (2.0 * PI * 8000.0 * n as f64 / SP_RATE).sin() as f32;
+            // skip the transient
+            let y = apply_biquad(x, &mut st, &b, &a);
+            if n > 5000 {
+                peak = peak.max(y.abs());
+            }
+        }
+        assert!(peak < 0.15, "lowpass leaked highs: {peak}");
+    }
+
+    #[test]
+    fn biquad_highpass_kills_lows_passes_highs() {
+        let (b, a) = biquad_coeffs(FilterKind::Highpass, 1000.0, SP_RATE);
+        let mut st = [0.0f32; 4];
+        let mut peak = 0.0f32;
+        for n in 0..26040 {
+            let x = (2.0 * PI * 8000.0 * n as f64 / SP_RATE).sin() as f32;
+            let y = apply_biquad(x, &mut st, &b, &a);
+            if n > 5000 {
+                peak = peak.max(y.abs());
+            }
+        }
+        assert!(peak > 0.9, "highpass ate the highs: {peak}");
+        let mut st = [0.0f32; 4];
+        let mut peak = 0.0f32;
+        for n in 0..26040 {
+            let x = (2.0 * PI * 100.0 * n as f64 / SP_RATE).sin() as f32;
+            let y = apply_biquad(x, &mut st, &b, &a);
+            if n > 5000 {
+                peak = peak.max(y.abs());
+            }
+        }
+        assert!(peak < 0.15, "highpass leaked lows: {peak}");
+    }
+
+    #[test]
+    fn filter_kind_round_trips_strings() {
+        assert_eq!(FilterKind::from_str("lp"), FilterKind::Lowpass);
+        assert_eq!(FilterKind::from_str("hp"), FilterKind::Highpass);
+        assert_eq!(FilterKind::from_str("bogus"), FilterKind::Off);
+        assert_eq!(FilterKind::Lowpass.as_str(), "lp");
+        assert_eq!(FilterKind::Off.cycle(), FilterKind::Lowpass);
+        assert_eq!(FilterKind::Highpass.cycle(), FilterKind::Off);
+    }
 
     #[test]
     fn js_round_matches_math_round() {

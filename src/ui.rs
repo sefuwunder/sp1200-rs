@@ -14,7 +14,7 @@ use sdl2::surface::Surface;
 use sdl2::video::Window;
 use std::time::Instant;
 
-use crate::engine::{Engine, N_PADS, N_STEPS};
+use crate::engine::{Engine, N_CHOKE_GROUPS, N_PADS, N_STEPS};
 
 pub const W: u32 = 1024;
 pub const H: u32 = 640;
@@ -180,6 +180,17 @@ fn hit_step(x: i32, y: i32) -> Option<usize> {
 
 // ---------- ui state ----------
 
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+pub enum Page {
+    Pads,
+    Edit,
+}
+
+pub struct Browser {
+    files: Vec<String>,
+    sel: usize,
+}
+
 pub struct Ui {
     pub selected_pad: usize,
     pub preset: usize,
@@ -188,6 +199,12 @@ pub struct Ui {
     pub project_path: Option<String>,
     /// Transient status line: (text, show-until, is-error).
     msg: Option<(String, Instant, bool)>,
+    /// Pads faceplate vs sample editor (Tab toggles).
+    pub page: Page,
+    /// Sample browser overlay (B opens, Enter loads into the selected pad).
+    pub browser: Option<Browser>,
+    /// Directory scanned by the browser (--samples-dir, default ./samples).
+    pub samples_dir: String,
 }
 
 impl Ui {
@@ -198,6 +215,9 @@ impl Ui {
             taps: Vec::new(),
             project_path: None,
             msg: None,
+            page: Page::Pads,
+            browser: None,
+            samples_dir: "./samples".to_string(),
         }
     }
 
@@ -220,114 +240,193 @@ pub fn handle_event(ui: &mut Ui, eng: &mut Engine, ev: &Event) -> bool {
         Event::Quit { .. } => return true,
         Event::KeyDown {
             keycode: Some(k), ..
-        } => match *k {
-            Keycode::Escape | Keycode::Q => return true,
-            Keycode::Space => {
-                if eng.playing {
-                    eng.stop();
-                } else {
-                    eng.play();
+        } => {
+            // Sample browser overlay eats its own keys.
+            if ui.browser.is_some() {
+                match *k {
+                    Keycode::Escape | Keycode::B => ui.browser = None,
+                    Keycode::Up => browser_move(ui, -1),
+                    Keycode::Down => browser_move(ui, 1),
+                    Keycode::Return | Keycode::KpEnter => browser_load(ui, eng),
+                    _ => {}
                 }
+                return false;
             }
-            Keycode::Num1 => {
-                ui.selected_pad = 0;
-                eng.trigger(0);
+            // Sample editor page keys (Tab/Up/Down handled here, the rest
+            // falls through to the global keys below).
+            if ui.page == Page::Edit {
+                let i = ui.selected_pad;
+                let handled = match *k {
+                    Keycode::Tab => {
+                        ui.page = Page::Pads;
+                        true
+                    }
+                    Keycode::Z => {
+                        eng.nudge_trim(i, 0, -0.01);
+                        true
+                    }
+                    Keycode::X => {
+                        eng.nudge_trim(i, 0, 0.01);
+                        true
+                    }
+                    Keycode::C => {
+                        eng.nudge_trim(i, 1, -0.01);
+                        true
+                    }
+                    Keycode::V => {
+                        eng.nudge_trim(i, 1, 0.01);
+                        true
+                    }
+                    Keycode::R => {
+                        eng.toggle_reverse(i);
+                        true
+                    }
+                    Keycode::N => {
+                        eng.normalize_pad(i);
+                        ui.say("NORMALIZED");
+                        true
+                    }
+                    Keycode::B => {
+                        open_browser(ui);
+                        true
+                    }
+                    Keycode::G => {
+                        let g = (eng.pads[i].choke + 1) % (N_CHOKE_GROUPS + 1);
+                        eng.set_choke(i, g);
+                        true
+                    }
+                    Keycode::F => {
+                        let kind = eng.pads[i].filter_kind.cycle();
+                        let cutoff = eng.pads[i].filter_cutoff;
+                        eng.set_filter(i, kind, cutoff);
+                        true
+                    }
+                    Keycode::Up => {
+                        eng.nudge_cutoff(i, true);
+                        true
+                    }
+                    Keycode::Down => {
+                        eng.nudge_cutoff(i, false);
+                        true
+                    }
+                    _ => false,
+                };
+                if handled {
+                    return false;
+                }
+            } else if *k == Keycode::Tab {
+                ui.page = Page::Edit;
+                return false;
             }
-            Keycode::Num2 => {
-                ui.selected_pad = 1;
-                eng.trigger(1);
-            }
-            Keycode::Num3 => {
-                ui.selected_pad = 2;
-                eng.trigger(2);
-            }
-            Keycode::Num4 => {
-                ui.selected_pad = 3;
-                eng.trigger(3);
-            }
-            Keycode::Num5 => {
-                ui.selected_pad = 4;
-                eng.trigger(4);
-            }
-            Keycode::Num6 => {
-                ui.selected_pad = 5;
-                eng.trigger(5);
-            }
-            Keycode::Num7 => {
-                ui.selected_pad = 6;
-                eng.trigger(6);
-            }
-            Keycode::Num8 => {
-                ui.selected_pad = 7;
-                eng.trigger(7);
-            }
-            Keycode::T => {
-                let now = Instant::now();
-                ui.taps
-                    .retain(|t| now.duration_since(*t).as_secs_f64() < 2.0);
-                ui.taps.push(now);
-                if ui.taps.len() >= 2 {
-                    let iv: Vec<f64> = ui
-                        .taps
-                        .windows(2)
-                        .map(|w| w[1].duration_since(w[0]).as_secs_f64())
-                        .collect();
-                    let avg = iv.iter().sum::<f64>() / iv.len() as f64;
-                    if avg > 0.0 {
-                        eng.bpm = (60.0 / avg).clamp(60.0, 200.0).round();
+            match *k {
+                Keycode::Escape | Keycode::Q => return true,
+                Keycode::Space => {
+                    if eng.playing {
+                        eng.stop();
+                    } else {
+                        eng.play();
                     }
                 }
-            }
-            Keycode::Left => eng.swing = (eng.swing - 1.0).clamp(50.0, 75.0),
-            Keycode::Right => eng.swing = (eng.swing + 1.0).clamp(50.0, 75.0),
-            Keycode::Up => eng.master = (eng.master + 0.05).clamp(0.0, 1.0),
-            Keycode::Down => eng.master = (eng.master - 0.05).clamp(0.0, 1.0),
-            Keycode::Comma => eng.bpm = (eng.bpm - 1.0).clamp(60.0, 200.0),
-            Keycode::Period => eng.bpm = (eng.bpm + 1.0).clamp(60.0, 200.0),
-            Keycode::F1 => {
-                eng.apply_preset(0);
-                ui.preset = 0;
-            }
-            Keycode::F2 => {
-                eng.apply_preset(1);
-                ui.preset = 1;
-            }
-            Keycode::F3 => {
-                eng.apply_preset(2);
-                ui.preset = 2;
-            }
-            Keycode::S => match eng.splice_onset() {
-                Some(n) => ui.say(format!("SPLICED: {n} CHOPS")),
-                None => ui.say_err("NO TAPE (DROP A .WAV)"),
-            },
-            Keycode::E => match eng.splice_equal() {
-                Some(n) => ui.say(format!("SLICED: {n} EQUAL PARTS")),
-                None => ui.say_err("NO TAPE (DROP A .WAV)"),
-            },
-            Keycode::D => {
-                eng.clear_tape();
-                ui.say("TAPE CLEARED");
-            }
-            Keycode::W => {
-                let path = ui
-                    .project_path
-                    .clone()
-                    .unwrap_or_else(|| "./sp1200-project.json".to_string());
-                let stem = path
-                    .rsplit(['/', '\\'])
-                    .next()
-                    .unwrap_or("sp1200-project.json");
-                let name = stem.rsplit_once('.').map(|(s, _)| s).unwrap_or(stem);
-                match crate::project::save_native_file(eng, &path, name) {
-                    Ok(()) => {
-                        ui.project_path = Some(path.clone());
-                        ui.say(format!("SAVED {path}"));
-                    }
-                    Err(e) => ui.say_err(e),
+                Keycode::Num1 => {
+                    ui.selected_pad = 0;
+                    eng.trigger(0);
                 }
+                Keycode::Num2 => {
+                    ui.selected_pad = 1;
+                    eng.trigger(1);
+                }
+                Keycode::Num3 => {
+                    ui.selected_pad = 2;
+                    eng.trigger(2);
+                }
+                Keycode::Num4 => {
+                    ui.selected_pad = 3;
+                    eng.trigger(3);
+                }
+                Keycode::Num5 => {
+                    ui.selected_pad = 4;
+                    eng.trigger(4);
+                }
+                Keycode::Num6 => {
+                    ui.selected_pad = 5;
+                    eng.trigger(5);
+                }
+                Keycode::Num7 => {
+                    ui.selected_pad = 6;
+                    eng.trigger(6);
+                }
+                Keycode::Num8 => {
+                    ui.selected_pad = 7;
+                    eng.trigger(7);
+                }
+                Keycode::T => {
+                    let now = Instant::now();
+                    ui.taps
+                        .retain(|t| now.duration_since(*t).as_secs_f64() < 2.0);
+                    ui.taps.push(now);
+                    if ui.taps.len() >= 2 {
+                        let iv: Vec<f64> = ui
+                            .taps
+                            .windows(2)
+                            .map(|w| w[1].duration_since(w[0]).as_secs_f64())
+                            .collect();
+                        let avg = iv.iter().sum::<f64>() / iv.len() as f64;
+                        if avg > 0.0 {
+                            eng.bpm = (60.0 / avg).clamp(60.0, 200.0).round();
+                        }
+                    }
+                }
+                Keycode::Left => eng.swing = (eng.swing - 1.0).clamp(50.0, 75.0),
+                Keycode::Right => eng.swing = (eng.swing + 1.0).clamp(50.0, 75.0),
+                Keycode::Up => eng.master = (eng.master + 0.05).clamp(0.0, 1.0),
+                Keycode::Down => eng.master = (eng.master - 0.05).clamp(0.0, 1.0),
+                Keycode::Comma => eng.bpm = (eng.bpm - 1.0).clamp(60.0, 200.0),
+                Keycode::Period => eng.bpm = (eng.bpm + 1.0).clamp(60.0, 200.0),
+                Keycode::F1 => {
+                    eng.apply_preset(0);
+                    ui.preset = 0;
+                }
+                Keycode::F2 => {
+                    eng.apply_preset(1);
+                    ui.preset = 1;
+                }
+                Keycode::F3 => {
+                    eng.apply_preset(2);
+                    ui.preset = 2;
+                }
+                Keycode::S => match eng.splice_onset() {
+                    Some(n) => ui.say(format!("SPLICED: {n} CHOPS")),
+                    None => ui.say_err("NO TAPE (DROP A .WAV)"),
+                },
+                Keycode::E => match eng.splice_equal() {
+                    Some(n) => ui.say(format!("SLICED: {n} EQUAL PARTS")),
+                    None => ui.say_err("NO TAPE (DROP A .WAV)"),
+                },
+                Keycode::D => {
+                    eng.clear_tape();
+                    ui.say("TAPE CLEARED");
+                }
+                Keycode::W => {
+                    let path = ui
+                        .project_path
+                        .clone()
+                        .unwrap_or_else(|| "./sp1200-project.json".to_string());
+                    let stem = path
+                        .rsplit(['/', '\\'])
+                        .next()
+                        .unwrap_or("sp1200-project.json");
+                    let name = stem.rsplit_once('.').map(|(s, _)| s).unwrap_or(stem);
+                    match crate::project::save_native_file(eng, &path, name) {
+                        Ok(()) => {
+                            ui.project_path = Some(path.clone());
+                            ui.say(format!("SAVED {path}"));
+                        }
+                        Err(e) => ui.say_err(e),
+                    }
+                }
+                _ => {}
             }
-            _ => {}
-        },
+        }
         Event::DropFile { filename, .. } => {
             drop_path(ui, eng, filename);
         }
@@ -351,6 +450,62 @@ pub fn handle_event(ui: &mut Ui, eng: &mut Engine, ev: &Event) -> bool {
 }
 
 // ---------- drawing ----------
+
+/// Scan a directory for .wav files (case-insensitive), sorted by name.
+fn scan_wavs(dir: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension()
+                .and_then(|x| x.to_str())
+                .map(|x| x.eq_ignore_ascii_case("wav"))
+                .unwrap_or(false)
+            {
+                out.push(p.to_string_lossy().to_string());
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn open_browser(ui: &mut Ui) {
+    let files = scan_wavs(&ui.samples_dir);
+    if files.is_empty() {
+        ui.say_err(format!("NO .WAV IN {}", ui.samples_dir.to_uppercase()));
+        return;
+    }
+    ui.browser = Some(Browser { files, sel: 0 });
+}
+
+fn browser_move(ui: &mut Ui, dir: i32) {
+    if let Some(b) = &mut ui.browser {
+        let n = b.files.len() as i32;
+        b.sel = (b.sel as i32 + dir).rem_euclid(n) as usize;
+    }
+}
+
+fn browser_load(ui: &mut Ui, eng: &mut Engine) {
+    let file = match &ui.browser {
+        Some(b) => match b.files.get(b.sel) {
+            Some(f) => f.clone(),
+            None => {
+                ui.say_err("NO FILES");
+                return;
+            }
+        },
+        None => return,
+    };
+    let pad = ui.selected_pad;
+    match eng.load_pad_sample(pad, &file) {
+        Ok(m) => {
+            ui.browser = None;
+            ui.say(m);
+        }
+        Err(e) => ui.say_err(e),
+    }
+}
 
 fn drop_path(ui: &mut Ui, eng: &mut Engine, path: &str) {
     let lower = path.to_lowercase();
@@ -383,6 +538,10 @@ fn mix(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> (u8, u8, u8) {
 }
 
 pub fn draw(p: &mut dyn Painter, ui: &Ui, eng: &Engine) {
+    if ui.page == Page::Edit {
+        draw_edit(p, ui, eng);
+        return;
+    }
     p.rect(0, 0, W, H, BG);
     // header plate
     p.rect(0, 0, W, 76, PLATE);
@@ -422,6 +581,22 @@ pub fn draw(p: &mut dyn Painter, ui: &Ui, eng: &Engine) {
         let label = eng.pad_label(i);
         let tw = text_w(&label, 2) as i32;
         p.text(x + (w as i32 - tw) / 2, y + 34, &label, 2, TEXT);
+        // choke + filter readout under the label
+        let mut sub = String::new();
+        if eng.pads[i].choke != 0 {
+            sub.push_str(&format!("G{} ", eng.pads[i].choke));
+        }
+        if eng.pads[i].filter_kind != crate::dsp::FilterKind::Off {
+            sub.push_str(&format!(
+                "{}{:04.0}",
+                eng.pads[i].filter_kind.abbrev(),
+                eng.pads[i].filter_cutoff
+            ));
+        }
+        if !sub.is_empty() {
+            let tw2 = text_w(&sub, 1) as i32;
+            p.text(x + (w as i32 - tw2) / 2, y + 60, &sub, 1, DIM);
+        }
         let key = format!("{}", i + 1);
         p.text(x + 10, y + 10, &key, 1, DIM);
     }
@@ -463,19 +638,14 @@ pub fn draw(p: &mut dyn Painter, ui: &Ui, eng: &Engine) {
         p.text(W as i32 - 200, 532, "STOPPED", 2, DIM);
     }
 
-    // transient status / error message
-    if let Some((text, until, is_err)) = &ui.msg {
-        if Instant::now() <= *until {
-            p.text(24, 550, text, 1, if *is_err { PLAYHEAD } else { TEXT });
-        }
-    }
+    draw_msg(p, ui);
 
     // footer help
     p.rect(0, 566, W, H - 566, PLATE);
     p.text(
         24,
         584,
-        "SPACE PLAY/STOP  T TAP  S/E SPLICE  D TAPE OFF  W SAVE  </> SWING  UP/DN MASTER  ,/. BPM  ESC QUIT",
+        "SPACE PLAY/STOP  T TAP  TAB SAMPLE EDIT  S/E SPLICE  D TAPE OFF  W SAVE  </> SWING  UP/DN MASTER  ,/. BPM  ESC QUIT",
         1,
         DIM,
     );
@@ -483,6 +653,141 @@ pub fn draw(p: &mut dyn Painter, ui: &Ui, eng: &Engine) {
         24,
         606,
         "1-8 PADS  F1-F3 PRESETS  CLICK PADS/STEPS  DROP .WAV FOR TAPE - DROP .JSON FOR PROJECT",
+        1,
+        DIM,
+    );
+}
+
+fn draw_msg(p: &mut dyn Painter, ui: &Ui) {
+    if let Some((text, until, is_err)) = &ui.msg {
+        if Instant::now() <= *until {
+            p.text(24, 550, text, 1, if *is_err { PLAYHEAD } else { TEXT });
+        }
+    }
+}
+
+/// Sample editor page: waveform of the selected pad's source with the trim
+/// region, plus choke / filter / reverse / normalize controls.
+fn draw_edit(p: &mut dyn Painter, ui: &Ui, eng: &Engine) {
+    p.rect(0, 0, W, H, BG);
+    p.rect(0, 0, W, 76, PLATE);
+    p.text(24, 22, "SP-1200 RS", 3, TEXT);
+    p.text(24, 52, "SAMPLE EDITOR", 1, DIM);
+
+    let i = ui.selected_pad;
+    let pad = &eng.pads[i];
+    p.text(
+        24,
+        88,
+        &format!("PAD {} {}", i + 1, eng.pad_label(i)),
+        2,
+        SEL,
+    );
+
+    // waveform
+    let (wx, wy, ww, wh) = (24i32, 124i32, 976u32, 190u32);
+    p.rect(wx, wy, ww, wh, PLATE);
+    let src = &pad.source;
+    if src.is_empty() {
+        p.text(wx + 20, wy + 88, "NO SAMPLE", 2, DIM);
+    } else {
+        let n = src.len();
+        let mid = wy + wh as i32 / 2;
+        p.rect(wx, mid, ww, 1, DIM);
+        let per = n as f64 / ww as f64;
+        let amp = wh as f32 / 2.0 - 6.0;
+        for px in 0..ww {
+            let a = (px as f64 * per) as usize;
+            let b = ((px as f64 + 1.0) * per) as usize + 1;
+            let (mut mn, mut mx) = (i16::MAX, i16::MIN);
+            for s in &src[a.min(n)..b.min(n)] {
+                mn = mn.min(*s);
+                mx = mx.max(*s);
+            }
+            let y1 = mid - (mx as f32 / 2047.0 * amp) as i32;
+            let y2 = mid - (mn as f32 / 2047.0 * amp) as i32;
+            let inside = px as f32 / ww as f32 >= pad.trim.0 && px as f32 / ww as f32 <= pad.trim.1;
+            p.rect(
+                wx + px as i32,
+                y1.min(y2),
+                1,
+                (y2 - y1).abs() as u32 + 1,
+                if inside { TEXT } else { DIM },
+            );
+        }
+        let mx0 = wx + (pad.trim.0 * ww as f32) as i32;
+        let mx1 = wx + (pad.trim.1 * ww as f32) as i32;
+        p.rect(mx0, wy, 2, wh, SEL);
+        p.rect(mx1, wy, 2, wh, SEL);
+    }
+
+    // params
+    let y0 = 336;
+    let left = [
+        format!("SOURCE {} SAMPLES", src.len()),
+        format!(
+            "TRIM {:02.0}% - {:02.0}%",
+            pad.trim.0 * 100.0,
+            pad.trim.1 * 100.0
+        ),
+        format!("REVERSE {}", if pad.reverse { "ON" } else { "OFF" }),
+        format!(
+            "CHOKE {}",
+            if pad.choke == 0 {
+                "--".to_string()
+            } else {
+                format!("G{}", pad.choke)
+            }
+        ),
+    ];
+    for (r, s) in left.iter().enumerate() {
+        p.text(24, y0 + r as i32 * 24, s, 1, TEXT);
+    }
+    let right = [
+        format!("FILTER {}", pad.filter_kind.abbrev()),
+        format!("CUTOFF {:04.0} HZ", pad.filter_cutoff),
+    ];
+    for (r, s) in right.iter().enumerate() {
+        p.text(560, y0 + r as i32 * 24, s, 1, TEXT);
+    }
+
+    // sample browser overlay
+    if let Some(b) = &ui.browser {
+        let (bw, bh) = (460i32, 320u32);
+        let (bx, by) = ((W as i32 - bw) / 2, 160);
+        p.rect(bx, by, bw as u32, bh, PLATE);
+        p.rect(bx, by, bw as u32, 3, SEL);
+        p.rect(bx, by + bh as i32 - 3, bw as u32, 3, SEL);
+        p.text(bx + 16, by + 12, "LOAD SAMPLE - ENTER", 1, SEL);
+        let show = 10usize;
+        let start = if b.files.len() > show {
+            b.sel.saturating_sub(show / 2).min(b.files.len() - show)
+        } else {
+            0
+        };
+        for (r, f) in b.files.iter().skip(start).take(show).enumerate() {
+            let name = f.rsplit(['/', '\\']).next().unwrap_or(f);
+            let disp: String = name.chars().take(36).collect();
+            let c = if start + r == b.sel { SEL } else { DIM };
+            p.text(bx + 16, by + 44 + r as i32 * 24, &disp.to_uppercase(), 1, c);
+        }
+    }
+
+    draw_msg(p, ui);
+
+    // footer help
+    p.rect(0, 566, W, H - 566, PLATE);
+    p.text(
+        24,
+        584,
+        "TAB PADS  Z/X TRIM START  C/V TRIM END  R REVERSE  N NORMALIZE",
+        1,
+        DIM,
+    );
+    p.text(
+        24,
+        606,
+        "B BROWSE SAMPLES  G CHOKE GROUP  F FILTER  UP/DN CUTOFF  1-8 SELECT+PLAY",
         1,
         DIM,
     );
@@ -528,6 +833,127 @@ mod tests {
         assert!(text.contains("\"bpm\": 133.0"), "{text}");
         assert!(text.contains("\"format\": \"sp1200-rs\""), "{text}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn edit_page_draw_no_panic() {
+        let mut eng = Engine::new();
+        // Give pad 0 a real sample with edits + filter + choke.
+        eng.pads[0].set_source(
+            (0..5000)
+                .map(|i| ((i as f32 * 0.7).sin() * 1800.0) as i16)
+                .collect(),
+            None,
+        );
+        eng.nudge_trim(0, 0, 0.2);
+        eng.toggle_reverse(0);
+        eng.set_choke(0, 2);
+        eng.set_filter(0, crate::dsp::FilterKind::Lowpass, 1200.0);
+        let mut ui = Ui::new();
+        ui.page = Page::Edit;
+        ui.selected_pad = 0;
+        let mut surf = Surface::new(W, H, PixelFormatEnum::RGB24).unwrap();
+        {
+            let p: &mut dyn Painter = &mut surf;
+            draw(p, &ui, &eng);
+        }
+        // And with an empty source.
+        eng.pads[1].set_source(Vec::new(), None);
+        ui.selected_pad = 1;
+        {
+            let p: &mut dyn Painter = &mut surf;
+            draw(p, &ui, &eng);
+        }
+    }
+
+    #[test]
+    fn browser_open_navigate_load() {
+        let dir = std::env::temp_dir().join(format!("sp1200rs-browse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["b.wav", "a.wav", "c.WAV", "note.txt"] {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(b"RIFF");
+            bytes.extend_from_slice(&44u32.to_le_bytes());
+            bytes.extend_from_slice(b"WAVEfmt ");
+            bytes.extend_from_slice(&16u32.to_le_bytes());
+            bytes.extend_from_slice(&1u16.to_le_bytes());
+            bytes.extend_from_slice(&1u16.to_le_bytes());
+            bytes.extend_from_slice(&44100u32.to_le_bytes());
+            bytes.extend_from_slice(&88200u32.to_le_bytes());
+            bytes.extend_from_slice(&2u16.to_le_bytes());
+            bytes.extend_from_slice(&16u16.to_le_bytes());
+            bytes.extend_from_slice(b"data");
+            bytes.extend_from_slice(&4u32.to_le_bytes());
+            bytes.extend_from_slice(&[1u8, 2, 3, 4]);
+            std::fs::write(dir.join(name), &bytes).unwrap();
+        }
+        let mut eng = Engine::new();
+        let mut ui = Ui::new();
+        ui.samples_dir = dir.to_str().unwrap().to_string();
+        ui.page = Page::Edit;
+        open_browser(&mut ui);
+        let b = ui.browser.as_ref().unwrap();
+        // sorted, .wav only (case-insensitive), note.txt excluded
+        assert_eq!(b.files.len(), 3);
+        assert!(b.files[0].ends_with("a.wav"));
+        // navigate + draw with overlay
+        browser_move(&mut ui, 1);
+        assert_eq!(ui.browser.as_ref().unwrap().sel, 1);
+        let mut surf = Surface::new(W, H, PixelFormatEnum::RGB24).unwrap();
+        {
+            let p: &mut dyn Painter = &mut surf;
+            draw(p, &ui, &eng);
+        }
+        // wrap-around
+        browser_move(&mut ui, -1);
+        browser_move(&mut ui, -1);
+        assert_eq!(ui.browser.as_ref().unwrap().sel, 2);
+        // load into pad 3 (selected)
+        ui.selected_pad = 2;
+        browser_load(&mut ui, &mut eng);
+        assert!(ui.browser.is_none());
+        assert!(eng.pads[2].custom);
+        assert!(!eng.pads[2].source.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn edit_keys_drive_engine() {
+        let mut eng = Engine::new();
+        let mut ui = Ui::new();
+        ui.page = Page::Edit;
+        let key = |kc| Event::KeyDown {
+            timestamp: 0,
+            window_id: 0,
+            keycode: Some(kc),
+            scancode: None,
+            keymod: sdl2::keyboard::Mod::NOMOD,
+            repeat: false,
+        };
+        // G cycles choke 0 -> 1 -> 2
+        handle_event(&mut ui, &mut eng, &key(Keycode::G));
+        handle_event(&mut ui, &mut eng, &key(Keycode::G));
+        assert_eq!(eng.pads[0].choke, 2);
+        // F cycles filter off -> lp
+        handle_event(&mut ui, &mut eng, &key(Keycode::F));
+        assert_eq!(eng.pads[0].filter_kind, crate::dsp::FilterKind::Lowpass);
+        // Up/Down move cutoff (not master) on the edit page
+        let m0 = eng.master;
+        let c0 = eng.pads[0].filter_cutoff;
+        handle_event(&mut ui, &mut eng, &key(Keycode::Up));
+        assert_eq!(eng.master, m0);
+        assert!(eng.pads[0].filter_cutoff > c0);
+        // R toggles reverse, Z trims
+        handle_event(&mut ui, &mut eng, &key(Keycode::R));
+        assert!(eng.pads[0].reverse);
+        handle_event(&mut ui, &mut eng, &key(Keycode::X));
+        assert!(eng.pads[0].trim.0 > 0.0);
+        // Tab goes back to pads
+        handle_event(&mut ui, &mut eng, &key(Keycode::Tab));
+        assert_eq!(ui.page, Page::Pads);
+        // and Tab from pads opens the editor
+        handle_event(&mut ui, &mut eng, &key(Keycode::Tab));
+        assert_eq!(ui.page, Page::Edit);
     }
 
     #[test]

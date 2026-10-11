@@ -49,7 +49,29 @@ time).
 | `W` | Save the project as JSON (to the loaded path, else `./sp1200-project.json`) |
 | Drop a `.wav` | Load it as the tape (through the 12-bit path, auto-spliced) |
 | Drop a `.json` | Load a project (`.sp1200.json` = web import, otherwise native) |
+| `Tab` | Toggle the sample editor for the selected pad |
 | `Esc` / `Q` | Quit |
+
+## Sample editor (`Tab`)
+
+The editor works on the selected pad's full source sample (drum, tape chop,
+or loaded WAV). Edits are non-destructive except normalize.
+
+| Input | Action |
+|---|---|
+| `Z` / `X` | Trim start −/+ |
+| `C` / `V` | Trim end −/+ |
+| `R` | Reverse the trimmed region |
+| `N` | Normalize source to 0.92 peak (destructive) |
+| `B` | Browse `./samples/` (or `--samples-dir`) — `Enter` loads the WAV onto the pad through the 12-bit path |
+| `G` | Cycle choke group: `--` → `G1` → `G2` → `G3` → `G4` (pads in a group cut each other off, like open/closed hats) |
+| `F` | Cycle per-pad filter: `OFF` → `LP` → `HP` (resonant biquad, runs per voice) |
+| `↑` / `↓` | Filter cutoff, 80 Hz – 12 kHz |
+
+`sp1200-rs --pad 3 kick.wav` loads a WAV onto pad 3 at startup. Choke
+groups, filters, trim, reverse, and user samples are saved into native
+projects (`W`); user samples are embedded as base64, so the project is
+self-contained.
 
 ## Tape & splicing
 
@@ -69,6 +91,8 @@ and fires chops like drums.
 
 `W` saves the native JSON format (versioned, `format: "sp1200-rs"`): name,
 bpm, swing, master, per-pad tune/level (and optional per-pad chop override),
+per-pad filter (type + cutoff), choke group, trim, reverse, label, and any
+user-loaded sample (embedded base64, so the project is self-contained),
 the full 16-step pattern, and tape name + chop markers. Tape *audio* is not
 embedded — load the project, then drop the `.wav`, and the saved chops apply
 to it. `sp1200-rs --project song.json` loads at startup; a dropped `.json`
@@ -89,6 +113,8 @@ sp1200-rs --render out.wav [seconds]   # render the fixed demo pattern to WAV
 sp1200-rs --shot out.bmp               # render one UI frame offscreen to BMP
 sp1200-rs --tape f.wav --shot out.bmp  # offscreen shot with a tape loaded
 sp1200-rs --project f.json             # load a project at startup
+sp1200-rs --pad 2 kick.wav             # load a WAV onto pad 2 at startup
+sp1200-rs --samples-dir ./my-wavs      # sample browser directory
 sp1200-rs --smoke [secs]               # run the UI headless for N s, exit 0
 sp1200-rs --help
 ```

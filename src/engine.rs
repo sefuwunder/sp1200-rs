@@ -4,11 +4,14 @@
 //! in f32; the offline `--render` path uses exact integer accumulation so it
 //! can be byte-compared against the JS reference.
 
-use crate::dsp::{self, js_round, XorShift32, DRUM_NAMES, SP_RATE};
+use crate::dsp::{self, js_round, FilterKind, XorShift32, DRUM_NAMES, SP_RATE};
 
 pub const N_PADS: usize = 8;
 pub const N_STEPS: usize = 16;
 pub const N_VOICES: usize = 16;
+
+/// Choke groups: 0 = none, 1..=4 = mute each other on trigger.
+pub const N_CHOKE_GROUPS: u8 = 4;
 
 /// Fixed seed so the instrument sounds identical on every launch.
 pub const DRUM_SEED: u32 = 0x1200_1987;
@@ -16,20 +19,96 @@ pub const DRUM_SEED: u32 = 0x1200_1987;
 /// Fixed seed for the `--render` parity demo.
 pub const RENDER_SEED: u32 = 0x12_345678;
 
+/// Default filter cutoff when a filter is first engaged.
+pub const FILTER_DEFAULT_CUTOFF: f32 = 3000.0;
+
 pub struct Pad {
+    /// Playable sample: trim + reverse applied to `source`.
     pub sample: Vec<i16>,
+    /// Full sample (drum synth, tape chop, or loaded WAV).
+    pub source: Vec<i16>,
     pub tune_st: f32,
     pub level: f32,
     /// Optional display label (from web project import); falls back to the
     /// drum name, or CHOP n in tape mode.
     pub label: Option<String>,
+    /// True when the source is a user sample (loaded WAV / web import):
+    /// saved into native projects as base64.
+    pub custom: bool,
+    pub filter_kind: FilterKind,
+    pub filter_cutoff: f32,
+    /// Precomputed biquad coefficients (b0,b1,b2 / a1,a2), refreshed by
+    /// `set_filter`.
+    pub fb: [f32; 3],
+    pub fa: [f32; 2],
+    pub choke: u8,
+    /// Non-destructive edit region, fractions of `source`.
+    pub trim: (f32, f32),
+    pub reverse: bool,
 }
 
 impl Pad {
+    fn fresh(sample: Vec<i16>) -> Self {
+        let (fb, fa) = dsp::biquad_coeffs(FilterKind::Off, FILTER_DEFAULT_CUTOFF, SP_RATE);
+        Self {
+            sample: sample.clone(),
+            source: sample,
+            tune_st: 0.0,
+            level: 0.9,
+            label: None,
+            custom: false,
+            filter_kind: FilterKind::Off,
+            filter_cutoff: FILTER_DEFAULT_CUTOFF,
+            fb,
+            fa,
+            choke: 0,
+            trim: (0.0, 1.0),
+            reverse: false,
+        }
+    }
+
     /// Varispeed replay ratio, like the hardware: tuning replays the sample
     /// faster or slower.
     pub fn ratio(&self) -> f64 {
         2f64.powf(self.tune_st as f64 / 12.0)
+    }
+
+    /// Rebuild the playable sample from source + trim + reverse.
+    pub fn rebuild(&mut self) {
+        let n = self.source.len();
+        if n == 0 {
+            self.sample.clear();
+            return;
+        }
+        let (ts, te) = self.trim;
+        let a = (ts.clamp(0.0, 1.0) * n as f32) as usize;
+        let b = (te.clamp(0.0, 1.0) * n as f32) as usize;
+        let (a, b) = (a.min(n), b.min(n));
+        let mut s: Vec<i16> = if b > a {
+            self.source[a..b].to_vec()
+        } else {
+            Vec::new()
+        };
+        if self.reverse {
+            s.reverse();
+        }
+        self.sample = s;
+    }
+
+    /// Install a new source sample: trim/reverse reset, playable rebuilt.
+    pub fn set_source(&mut self, source: Vec<i16>, label: Option<String>) {
+        self.source = source;
+        self.trim = (0.0, 1.0);
+        self.reverse = false;
+        self.label = label;
+        self.rebuild();
+    }
+
+    /// Recompute biquad coefficients from kind + cutoff.
+    pub fn refresh_filter(&mut self) {
+        let (fb, fa) = dsp::biquad_coeffs(self.filter_kind, self.filter_cutoff, SP_RATE);
+        self.fb = fb;
+        self.fa = fa;
     }
 }
 
@@ -53,6 +132,8 @@ struct Voice {
     pad: usize,
     pos: f64,
     age: u64,
+    /// Biquad state [x1, x2, y1, y2] for the pad's filter.
+    fstate: [f32; 4],
 }
 
 impl Voice {
@@ -62,6 +143,7 @@ impl Voice {
             pad: 0,
             pos: 0.0,
             age: 0,
+            fstate: [0.0; 4],
         }
     }
 }
@@ -98,12 +180,7 @@ impl Engine {
         let mut rng = XorShift32::new(DRUM_SEED);
         let pads: Vec<Pad> = DRUM_NAMES
             .iter()
-            .map(|name| Pad {
-                sample: dsp::synth_drum_i16(name, &mut rng),
-                tune_st: 0.0,
-                level: 0.9,
-                label: None,
-            })
+            .map(|name| Pad::fresh(dsp::synth_drum_i16(name, &mut rng)))
             .collect();
         let pad_factory = pads
             .iter()
@@ -136,6 +213,15 @@ impl Engine {
         if pad >= N_PADS || self.pads[pad].sample.is_empty() {
             return;
         }
+        // Choke: pads sharing a group cut each other's voices.
+        let g = self.pads[pad].choke;
+        if g != 0 {
+            for v in self.voices.iter_mut() {
+                if v.active && v.pad != pad && self.pads[v.pad].choke == g {
+                    v.active = false;
+                }
+            }
+        }
         // Steal the oldest voice if all are busy.
         let mut slot = None;
         let mut oldest = u64::MAX;
@@ -157,6 +243,7 @@ impl Engine {
             pad,
             pos: 0.0,
             age: self.voice_age,
+            fstate: [0.0; 4],
         };
         self.pad_hit_at[pad] = self.clock;
     }
@@ -259,7 +346,8 @@ impl Engine {
     }
 
     /// Re-derive pad samples from the tape + chop map. Pads without a chop
-    /// (or with no tape audio) play their drum-mode sample.
+    /// (or with no tape audio) play their drum-mode sample. Trim/reverse
+    /// edits apply on top of whatever source lands here.
     pub(crate) fn refresh_pad_samples(&mut self) {
         let resolved: Vec<(Vec<i16>, Option<usize>)> = (0..N_PADS)
             .map(|i| {
@@ -280,7 +368,8 @@ impl Engine {
             })
             .collect();
         for (i, (s, m)) in resolved.into_iter().enumerate() {
-            self.pads[i].sample = s;
+            self.pads[i].source = s;
+            self.pads[i].rebuild();
             self.chop_map[i] = m;
         }
     }
@@ -293,10 +382,109 @@ impl Engine {
             return;
         }
         self.pad_factory[i] = sample.clone();
-        self.pads[i].label = label;
+        self.pads[i].custom = true;
         if self.chop_map[i].is_none() {
-            self.pads[i].sample = sample;
+            // Fresh source: trim/reverse reset; project load re-applies
+            // saved edits afterwards.
+            self.pads[i].set_source(sample, label);
+        } else {
+            self.pads[i].label = label;
         }
+    }
+
+    // ---------- per-pad sound design ----------
+
+    /// Load a WAV file onto a pad: decode → normalize → the 12-bit path,
+    /// like the tape loader. Becomes the pad's drum-mode sample.
+    pub fn load_pad_sample(&mut self, i: usize, path: &str) -> Result<String, String> {
+        if i >= N_PADS {
+            return Err("bad pad".to_string());
+        }
+        let file = path.rsplit(['/', '\\']).next().unwrap_or(path);
+        let data = std::fs::read(path).map_err(|e| format!("can't read {file}: {e}"))?;
+        let wav = crate::wav::decode_wav(&data).map_err(|e| format!("{file}: {e}"))?;
+        if wav.samples.is_empty() {
+            return Err(format!("{file}: no audio"));
+        }
+        let mut clean = wav.samples;
+        dsp::normalize(&mut clean, 0.92);
+        let audio = dsp::sp1200ize_i16(&clean, wav.sample_rate as f64);
+        let label: String = file_stem(path).to_uppercase().chars().take(12).collect();
+        let n = audio.len();
+        self.pad_factory[i] = audio.clone();
+        self.pads[i].custom = true;
+        self.pads[i].set_source(audio, Some(label.clone()));
+        Ok(format!("PAD {} <- {label} ({n} SAMPLES)", i + 1))
+    }
+
+    /// Set the pad's filter. Cutoff is clamped to 80..12000 Hz.
+    pub fn set_filter(&mut self, i: usize, kind: FilterKind, cutoff: f32) {
+        if i >= N_PADS {
+            return;
+        }
+        let p = &mut self.pads[i];
+        p.filter_kind = kind;
+        p.filter_cutoff = cutoff.clamp(80.0, 12000.0);
+        p.refresh_filter();
+    }
+
+    /// Nudge the filter cutoff multiplicatively (the UI's Up/Down).
+    pub fn nudge_cutoff(&mut self, i: usize, up: bool) {
+        if i >= N_PADS {
+            return;
+        }
+        let factor = if up { 1.122 } else { 1.0 / 1.122 };
+        let cutoff = (self.pads[i].filter_cutoff * factor).clamp(80.0, 12000.0);
+        let kind = self.pads[i].filter_kind;
+        self.set_filter(i, kind, cutoff);
+    }
+
+    /// Set the pad's choke group (0 = none).
+    pub fn set_choke(&mut self, i: usize, group: u8) {
+        if i >= N_PADS {
+            return;
+        }
+        self.pads[i].choke = group.min(N_CHOKE_GROUPS);
+    }
+
+    /// Nudge a trim edge by `delta` (fraction of the source, signed).
+    /// `which`: 0 = start, 1 = end. Start never passes end and vice versa.
+    pub fn nudge_trim(&mut self, i: usize, which: usize, delta: f32) {
+        if i >= N_PADS {
+            return;
+        }
+        let p = &mut self.pads[i];
+        if which == 0 {
+            p.trim.0 = (p.trim.0 + delta).clamp(0.0, p.trim.1 - 0.01);
+        } else {
+            p.trim.1 = (p.trim.1 + delta).clamp(p.trim.0 + 0.01, 1.0);
+        }
+        p.rebuild();
+    }
+
+    /// Toggle reverse playback of the trimmed region.
+    pub fn toggle_reverse(&mut self, i: usize) {
+        if i >= N_PADS {
+            return;
+        }
+        let p = &mut self.pads[i];
+        p.reverse = !p.reverse;
+        p.rebuild();
+    }
+
+    /// Destructively normalize the pad's source to 0.92 peak, then rebuild.
+    pub fn normalize_pad(&mut self, i: usize) {
+        if i >= N_PADS || self.pads[i].source.is_empty() {
+            return;
+        }
+        let mut f: Vec<f32> = self.pads[i]
+            .source
+            .iter()
+            .map(|&s| s as f32 / 2047.0)
+            .collect();
+        dsp::normalize(&mut f, 0.92);
+        self.pads[i].source = dsp::quantize12_i16(&f);
+        self.pads[i].rebuild();
     }
 
     /// Display label for a pad: CHOP n in tape mode, else custom label or
@@ -362,7 +550,15 @@ impl Engine {
                 let frac = (v.pos - idx as f64) as f32;
                 let a = pad.sample[idx] as f32 / 2047.0;
                 let b = pad.sample[idx + 1] as f32 / 2047.0;
-                mix += (a + (b - a) * frac) * pad.level;
+                let x = (a + (b - a) * frac) * pad.level;
+                // Off is a branch, not a pass-through filter: bit-identical
+                // to the pre-filter mixer.
+                let y = if pad.filter_kind == FilterKind::Off {
+                    x
+                } else {
+                    dsp::apply_biquad(x, &mut v.fstate, &pad.fb, &pad.fa)
+                };
+                mix += y;
                 v.pos += pad.ratio();
             }
             *s = (mix * self.master).clamp(-1.0, 1.0);
@@ -543,6 +739,163 @@ pub fn load_tape_file(eng: &mut Engine, path: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn choke_group_kills_same_group_voices() {
+        let mut e = Engine::new();
+        e.set_choke(0, 1);
+        e.set_choke(1, 1);
+        e.set_choke(2, 2);
+        e.trigger(0);
+        e.trigger(2);
+        assert_eq!(e.voices.iter().filter(|v| v.active).count(), 2);
+        // Pad 1 shares group 1 with pad 0: pad 0's voice dies.
+        e.trigger(1);
+        let active: Vec<usize> = e
+            .voices
+            .iter()
+            .filter(|v| v.active)
+            .map(|v| v.pad)
+            .collect();
+        assert!(!active.contains(&0), "choked voice survived: {active:?}");
+        assert!(active.contains(&1));
+        assert!(active.contains(&2), "other group killed: {active:?}");
+        // Group 0 never chokes.
+        e.set_choke(0, 0);
+        e.set_choke(1, 0);
+        e.trigger(0);
+        e.trigger(1);
+        assert!(e.voices.iter().filter(|v| v.active && v.pad == 0).count() >= 1);
+    }
+
+    #[test]
+    fn trim_and_reverse_rebuild() {
+        let mut e = Engine::new();
+        let src = e.pads[0].source.clone();
+        let n = src.len();
+        e.nudge_trim(0, 0, 0.5); // start -> 50%
+        e.nudge_trim(0, 1, -0.25); // end -> 75%
+        assert!((e.pads[0].trim.0 - 0.5).abs() < 1e-6);
+        assert!((e.pads[0].trim.1 - 0.75).abs() < 1e-6);
+        let expect_len = (0.75 * n as f32) as usize - (0.5 * n as f32) as usize;
+        assert_eq!(e.pads[0].sample.len(), expect_len);
+        // Start can never pass end.
+        e.nudge_trim(0, 0, 0.9);
+        assert!(e.pads[0].trim.0 <= e.pads[0].trim.1);
+        // Reverse flips the playable buffer.
+        let before = e.pads[0].sample.clone();
+        e.toggle_reverse(0);
+        assert!(e.pads[0].reverse);
+        let after = &e.pads[0].sample;
+        assert_eq!(after.len(), before.len());
+        assert_eq!(after[0], before[before.len() - 1]);
+        assert_eq!(after[after.len() - 1], before[0]);
+    }
+
+    #[test]
+    fn filter_off_is_bit_identical_to_legacy_mix() {
+        // Two engines, same trigger: Off must match sample-for-sample.
+        let mut a = Engine::new();
+        let mut b = Engine::new();
+        b.set_filter(0, FilterKind::Off, 8000.0);
+        a.trigger(0);
+        b.trigger(0);
+        let mut oa = vec![0.0f32; 5000];
+        let mut ob = vec![0.0f32; 5000];
+        a.render(&mut oa);
+        b.render(&mut ob);
+        assert_eq!(oa, ob);
+    }
+
+    #[test]
+    fn filter_lp_changes_output_and_hp_too() {
+        let mut e = Engine::new();
+        // Click-like source: full-spectrum, so filters bite.
+        let click: Vec<i16> = (0..2000).map(|i| if i == 0 { 2047 } else { 0 }).collect();
+        e.pads[0].set_source(click, None);
+        e.pads[0].level = 1.0;
+        e.master = 1.0;
+        e.trigger(0);
+        let mut off = vec![0.0f32; 2000];
+        e.render(&mut off);
+        let peak_off = off.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+
+        let mut e2 = Engine::new();
+        e2.pads[0].set_source(
+            (0..2000).map(|i| if i == 0 { 2047 } else { 0 }).collect(),
+            None,
+        );
+        e2.pads[0].level = 1.0;
+        e2.master = 1.0;
+        e2.set_filter(0, FilterKind::Lowpass, 400.0);
+        e2.trigger(0);
+        let mut lp = vec![0.0f32; 2000];
+        e2.render(&mut lp);
+        let peak_lp = lp.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        assert!(
+            peak_lp < peak_off * 0.5,
+            "LP did not tame the click: {peak_lp} vs {peak_off}"
+        );
+        for v in lp.iter() {
+            assert!(v.is_finite());
+        }
+        // Cutoff knob moves the coefficients.
+        let before = e2.pads[0].fb;
+        e2.nudge_cutoff(0, true);
+        assert!(e2.pads[0].filter_cutoff > 400.0);
+        assert_ne!(e2.pads[0].fb, before);
+    }
+
+    #[test]
+    fn normalize_pad_peaks_at_target() {
+        let mut e = Engine::new();
+        e.pads[0].set_source(vec![100i16; 1000], None);
+        e.normalize_pad(0);
+        let peak = e.pads[0]
+            .source
+            .iter()
+            .map(|v| v.unsigned_abs())
+            .max()
+            .unwrap();
+        // 0.92 * 2047 = 1883.24 -> quantized
+        assert!((peak as i32 - 1883).abs() <= 1, "peak {peak}");
+        assert_eq!(e.pads[0].source.len(), 1000);
+    }
+
+    #[test]
+    fn load_pad_sample_reads_wav() {
+        let dir = std::env::temp_dir().join(format!("sp1200rs-pad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("blip.wav");
+        // Minimal mono 16-bit WAV, 44.1 kHz, 100 samples of a ramp.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&((36 + 200) as u32).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&44100u32.to_le_bytes());
+        bytes.extend_from_slice(&88200u32.to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&200u32.to_le_bytes());
+        for i in 0..100 {
+            let s = (i as i16 * 300).min(30000);
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        std::fs::write(&path, &bytes).unwrap();
+        let mut e = Engine::new();
+        let msg = e.load_pad_sample(3, path.to_str().unwrap()).unwrap();
+        assert!(msg.contains("PAD 4"), "{msg}");
+        assert!(!e.pads[3].source.is_empty());
+        assert!(e.pads[3].custom);
+        assert_eq!(e.pads[3].label.as_deref(), Some("BLIP"));
+        // 12-bit path: all samples within +-2047.
+        assert!(e.pads[3].source.iter().all(|&s| s.unsigned_abs() <= 2047));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn engine_boots_with_drums() {
