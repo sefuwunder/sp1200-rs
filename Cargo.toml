@@ -10,6 +10,8 @@ sdl2 = "0.37"
 # hand-rolled in project.rs (~30 lines) to avoid another dependency.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# MP3 import: minimp3 bundles its C decoder, no system dependencies.
+minimp3 = "0.5"
 
 [profile.release]
 opt-level = 3

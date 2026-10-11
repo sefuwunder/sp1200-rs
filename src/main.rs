@@ -11,6 +11,7 @@
 #![deny(warnings)]
 
 mod audio;
+mod decode;
 mod dsp;
 mod engine;
 mod project;
@@ -254,8 +255,8 @@ fn run_app_for(
 fn print_help() {
     println!("sp1200-rs — SP-1200 drum machine (Rust + SDL2)");
     println!("  sp1200-rs                  launch the faceplate UI");
-    println!("  sp1200-rs --tape file.wav  load a tape at startup");
-    println!("  sp1200-rs --pad N file.wav load a WAV onto pad N (1-8) at startup");
+    println!("  sp1200-rs --tape file.wav  load a tape at startup (.wav/.mp3)");
+    println!("  sp1200-rs --pad N file.wav load audio onto pad N (1-8) at startup");
     println!("  sp1200-rs --samples-dir D  sample browser directory (default ./samples)");
     println!("  sp1200-rs --project f.json load a project (.sp1200.json = web import)");
     println!("  sp1200-rs --render out.wav [seconds]");
@@ -267,7 +268,7 @@ fn print_help() {
         "      W save project, 1-8 pads, F1-F3 presets, arrows/comma/period adjust, ESC quit."
     );
     println!("      editor: Z/X C/V trim, R reverse, N normalize, B browse, G choke, F filter.");
-    println!("      drop a .wav or .json file onto the window to load it.");
+    println!("      drop a .wav/.mp3 or .json file onto the window to load it.");
 }
 
 fn flag_value(args: &[String], flag: &str) -> Option<String> {

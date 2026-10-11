@@ -77,9 +77,11 @@ self-contained.
 
 `sp1200-rs --tape break.wav` (or drop the file onto the window) loads a tape:
 16-bit PCM or 32-bit float WAV, mono or stereo (mixed down), any sample rate —
-decoded by a small zero-dependency reader in `src/wav.rs`, normalized like the
-web (`normalize(clean, 0.92)`), then run through the SP-1200 converters
-(resample to 26.04 kHz + 12-bit quantize).
+decoded by a small zero-dependency reader in `src/wav.rs` — or MP3 (decoded
+by minimp3, ID3 tags skipped) — normalized like the web
+(`normalize(clean, 0.92)`), then run through the SP-1200 converters
+(resample to 26.04 kHz + 12-bit quantize). The sample browser, `--pad`, and
+drag-and-drop all accept `.wav` and `.mp3`.
 
 On load the tape is auto-spliced by onset detection; `S` re-splices, `E`
 slices into 8 equal parts, `D` clears it. Pads 1–8 trigger chops 1–8 (more

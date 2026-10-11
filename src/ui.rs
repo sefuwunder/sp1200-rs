@@ -396,11 +396,11 @@ pub fn handle_event(ui: &mut Ui, eng: &mut Engine, ev: &Event) -> bool {
                 }
                 Keycode::S => match eng.splice_onset() {
                     Some(n) => ui.say(format!("SPLICED: {n} CHOPS")),
-                    None => ui.say_err("NO TAPE (DROP A .WAV)"),
+                    None => ui.say_err("NO TAPE (DROP AUDIO)"),
                 },
                 Keycode::E => match eng.splice_equal() {
                     Some(n) => ui.say(format!("SLICED: {n} EQUAL PARTS")),
-                    None => ui.say_err("NO TAPE (DROP A .WAV)"),
+                    None => ui.say_err("NO TAPE (DROP AUDIO)"),
                 },
                 Keycode::D => {
                     eng.clear_tape();
@@ -451,15 +451,16 @@ pub fn handle_event(ui: &mut Ui, eng: &mut Engine, ev: &Event) -> bool {
 
 // ---------- drawing ----------
 
-/// Scan a directory for .wav files (case-insensitive), sorted by name.
-fn scan_wavs(dir: &str) -> Vec<String> {
+/// Scan a directory for audio files (.wav / .mp3, case-insensitive),
+/// sorted by name.
+fn scan_audio(dir: &str) -> Vec<String> {
     let mut out = Vec::new();
     if let Ok(rd) = std::fs::read_dir(dir) {
         for e in rd.flatten() {
             let p = e.path();
             if p.extension()
                 .and_then(|x| x.to_str())
-                .map(|x| x.eq_ignore_ascii_case("wav"))
+                .map(|x| x.eq_ignore_ascii_case("wav") || x.eq_ignore_ascii_case("mp3"))
                 .unwrap_or(false)
             {
                 out.push(p.to_string_lossy().to_string());
@@ -471,9 +472,9 @@ fn scan_wavs(dir: &str) -> Vec<String> {
 }
 
 fn open_browser(ui: &mut Ui) {
-    let files = scan_wavs(&ui.samples_dir);
+    let files = scan_audio(&ui.samples_dir);
     if files.is_empty() {
-        ui.say_err(format!("NO .WAV IN {}", ui.samples_dir.to_uppercase()));
+        ui.say_err(format!("NO AUDIO IN {}", ui.samples_dir.to_uppercase()));
         return;
     }
     ui.browser = Some(Browser { files, sel: 0 });
@@ -509,7 +510,7 @@ fn browser_load(ui: &mut Ui, eng: &mut Engine) {
 
 fn drop_path(ui: &mut Ui, eng: &mut Engine, path: &str) {
     let lower = path.to_lowercase();
-    if lower.ends_with(".wav") {
+    if lower.ends_with(".wav") || lower.ends_with(".mp3") {
         match crate::engine::load_tape_file(eng, path) {
             Ok(m) => ui.say(m),
             Err(e) => ui.say_err(e),
@@ -524,7 +525,7 @@ fn drop_path(ui: &mut Ui, eng: &mut Engine, path: &str) {
         }
     } else {
         let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
-        ui.say_err(format!("can't open {name} (drop .wav or .json)"));
+        ui.say_err(format!("can't open {name} (drop .wav/.mp3 or .json)"));
     }
 }
 
@@ -652,7 +653,7 @@ pub fn draw(p: &mut dyn Painter, ui: &Ui, eng: &Engine) {
     p.text(
         24,
         606,
-        "1-8 PADS  F1-F3 PRESETS  CLICK PADS/STEPS  DROP .WAV FOR TAPE - DROP .JSON FOR PROJECT",
+        "1-8 PADS  F1-F3 PRESETS  CLICK PADS/STEPS  DROP .WAV/.MP3 TAPE - DROP .JSON PROJECT",
         1,
         DIM,
     );
@@ -870,7 +871,7 @@ mod tests {
     fn browser_open_navigate_load() {
         let dir = std::env::temp_dir().join(format!("sp1200rs-browse-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        for name in ["b.wav", "a.wav", "c.WAV", "note.txt"] {
+        for name in ["b.wav", "a.wav", "c.WAV", "d.mp3", "note.txt"] {
             let mut bytes = Vec::new();
             bytes.extend_from_slice(b"RIFF");
             bytes.extend_from_slice(&44u32.to_le_bytes());
@@ -893,9 +894,10 @@ mod tests {
         ui.page = Page::Edit;
         open_browser(&mut ui);
         let b = ui.browser.as_ref().unwrap();
-        // sorted, .wav only (case-insensitive), note.txt excluded
-        assert_eq!(b.files.len(), 3);
+        // sorted, .wav + .mp3 (case-insensitive), note.txt excluded
+        assert_eq!(b.files.len(), 4);
         assert!(b.files[0].ends_with("a.wav"));
+        assert!(b.files[3].ends_with("d.mp3"));
         // navigate + draw with overlay
         browser_move(&mut ui, 1);
         assert_eq!(ui.browser.as_ref().unwrap().sel, 1);
@@ -907,8 +909,10 @@ mod tests {
         // wrap-around
         browser_move(&mut ui, -1);
         browser_move(&mut ui, -1);
-        assert_eq!(ui.browser.as_ref().unwrap().sel, 2);
-        // load into pad 3 (selected)
+        assert_eq!(ui.browser.as_ref().unwrap().sel, 3);
+        // wrap forward onto a.wav (a real WAV) and load into pad 3
+        browser_move(&mut ui, 1);
+        assert_eq!(ui.browser.as_ref().unwrap().sel, 0);
         ui.selected_pad = 2;
         browser_load(&mut ui, &mut eng);
         assert!(ui.browser.is_none());

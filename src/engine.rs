@@ -394,21 +394,20 @@ impl Engine {
 
     // ---------- per-pad sound design ----------
 
-    /// Load a WAV file onto a pad: decode → normalize → the 12-bit path,
+    /// Load a WAV/MP3 file onto a pad: decode → normalize → the 12-bit path,
     /// like the tape loader. Becomes the pad's drum-mode sample.
     pub fn load_pad_sample(&mut self, i: usize, path: &str) -> Result<String, String> {
         if i >= N_PADS {
             return Err("bad pad".to_string());
         }
         let file = path.rsplit(['/', '\\']).next().unwrap_or(path);
-        let data = std::fs::read(path).map_err(|e| format!("can't read {file}: {e}"))?;
-        let wav = crate::wav::decode_wav(&data).map_err(|e| format!("{file}: {e}"))?;
-        if wav.samples.is_empty() {
+        let dec = crate::decode::decode_file(path)?;
+        if dec.samples.is_empty() {
             return Err(format!("{file}: no audio"));
         }
-        let mut clean = wav.samples;
+        let mut clean = dec.samples;
         dsp::normalize(&mut clean, 0.92);
-        let audio = dsp::sp1200ize_i16(&clean, wav.sample_rate as f64);
+        let audio = dsp::sp1200ize_i16(&clean, dec.sample_rate as f64);
         let label: String = file_stem(path).to_uppercase().chars().take(12).collect();
         let n = audio.len();
         self.pad_factory[i] = audio.clone();
@@ -719,18 +718,17 @@ fn file_stem(path: &str) -> String {
     }
 }
 
-/// Load a .wav as the tape: decode → normalize (like the web) → the 12-bit
-/// path → auto-splice. Returns a status line for the UI.
+/// Load a .wav/.mp3 as the tape: decode → normalize (like the web) → the
+/// 12-bit path → auto-splice. Returns a status line for the UI.
 pub fn load_tape_file(eng: &mut Engine, path: &str) -> Result<String, String> {
-    let data = std::fs::read(path).map_err(|e| format!("can't read {}: {e}", file_name(path)))?;
-    let wav = crate::wav::decode_wav(&data).map_err(|e| format!("{}: {e}", file_name(path)))?;
-    if wav.samples.is_empty() {
+    let dec = crate::decode::decode_file(path)?;
+    if dec.samples.is_empty() {
         return Err(format!("{}: no audio", file_name(path)));
     }
     // Mirror the web pipeline: normalize clean, then the SP-1200 converters.
-    let mut clean = wav.samples;
+    let mut clean = dec.samples;
     dsp::normalize(&mut clean, 0.92);
-    let audio = dsp::sp1200ize_i16(&clean, wav.sample_rate as f64);
+    let audio = dsp::sp1200ize_i16(&clean, dec.sample_rate as f64);
     let name: String = file_stem(path).to_uppercase().chars().take(18).collect();
     let n = eng.load_tape(name.clone(), audio);
     Ok(format!("TAPE {name} - {n} CHOPS (S/E RESPLICE, D CLEAR)"))
@@ -860,6 +858,35 @@ mod tests {
         // 0.92 * 2047 = 1883.24 -> quantized
         assert!((peak as i32 - 1883).abs() <= 1, "peak {peak}");
         assert_eq!(e.pads[0].source.len(), 1000);
+    }
+
+    #[test]
+    fn load_pad_sample_reads_mp3() {
+        let mut e = Engine::new();
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/sine.mp3");
+        let msg = e.load_pad_sample(1, path).unwrap();
+        assert!(msg.contains("PAD 2"), "{msg}");
+        assert!(!e.pads[1].source.is_empty());
+        assert!(e.pads[1].custom);
+        assert_eq!(e.pads[1].label.as_deref(), Some("SINE"));
+        // 12-bit path: all samples within +-2047.
+        assert!(e.pads[1].source.iter().all(|&s| s.unsigned_abs() <= 2047));
+        // Trigger + render: no panic, finite output.
+        e.trigger(1);
+        let mut out = vec![0.0f32; 5000];
+        e.render(&mut out);
+        assert!(out.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn load_tape_file_reads_mp3() {
+        let mut e = Engine::new();
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/sine.mp3");
+        let msg = load_tape_file(&mut e, path).unwrap();
+        assert!(msg.contains("TAPE SINE"), "{msg}");
+        assert!(e.tape.is_some());
+        assert!(!e.tape.as_ref().unwrap().audio.is_empty());
+        assert!(!e.tape.as_ref().unwrap().chops.is_empty());
     }
 
     #[test]
