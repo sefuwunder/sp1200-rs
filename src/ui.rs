@@ -429,7 +429,7 @@ pub fn handle_event(ui: &mut Ui, eng: &mut Engine, ev: &Event) -> bool {
                 return false;
             }
             match *k {
-                Keycode::Escape | Keycode::Q => return true,
+                Keycode::Escape => return true,
                 Keycode::A => {
                     ui.page = Page::Tape;
                 }
