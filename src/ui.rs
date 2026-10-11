@@ -87,6 +87,8 @@ fn glyph(c: char) -> Option<[u8; 7]> {
         '>' => [0x08, 0x04, 0x02, 0x01, 0x02, 0x04, 0x08],
         '(' => [0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02],
         ')' => [0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08],
+        '[' => [0x0E, 0x08, 0x08, 0x08, 0x08, 0x08, 0x0E],
+        ']' => [0x0E, 0x02, 0x02, 0x02, 0x02, 0x02, 0x0E],
         '!' => [0x04, 0x04, 0x04, 0x04, 0x04, 0, 0x04],
         '?' => [0x0E, 0x11, 0x01, 0x02, 0x04, 0, 0x04],
         '#' => [0x0A, 0x0A, 0x1F, 0x0A, 0x1F, 0x0A, 0x0A],
@@ -299,6 +301,32 @@ pub fn handle_event(ui: &mut Ui, eng: &mut Engine, ev: &Event) -> bool {
                         let kind = eng.pads[i].filter_kind.cycle();
                         let cutoff = eng.pads[i].filter_cutoff;
                         eng.set_filter(i, kind, cutoff);
+                        true
+                    }
+                    Keycode::M => {
+                        let mono = !eng.pads[i].mono;
+                        eng.set_mono(i, mono);
+                        ui.say(format!(
+                            "PAD {} {}",
+                            i + 1,
+                            if mono { "MONO" } else { "POLY" }
+                        ));
+                        true
+                    }
+                    Keycode::LeftBracket => {
+                        eng.nudge_pitch(i, -1.0);
+                        true
+                    }
+                    Keycode::RightBracket => {
+                        eng.nudge_pitch(i, 1.0);
+                        true
+                    }
+                    Keycode::Minus => {
+                        eng.nudge_res(i, false);
+                        true
+                    }
+                    Keycode::Equals => {
+                        eng.nudge_res(i, true);
                         true
                     }
                     Keycode::Up => {
@@ -598,6 +626,9 @@ pub fn draw(p: &mut dyn Painter, ui: &Ui, eng: &Engine) {
         p.text(x + (w as i32 - tw) / 2, y + 34, &label, 2, TEXT);
         // choke + filter readout under the label
         let mut sub = String::new();
+        if eng.pads[i].mono {
+            sub.push_str("M ");
+        }
         if eng.pads[i].choke != 0 {
             sub.push_str(&format!("G{} ", eng.pads[i].choke));
         }
@@ -758,6 +789,8 @@ fn draw_edit(p: &mut dyn Painter, ui: &Ui, eng: &Engine) {
             }
         ),
         format!("LOCK {}", if pad.locked { "ON" } else { "OFF" }),
+        format!("MODE {}", if pad.mono { "MONO" } else { "POLY" }),
+        format!("PITCH {:+.1} ST", pad.tune_st),
     ];
     for (r, s) in left.iter().enumerate() {
         p.text(24, y0 + r as i32 * 24, s, 1, TEXT);
@@ -765,6 +798,7 @@ fn draw_edit(p: &mut dyn Painter, ui: &Ui, eng: &Engine) {
     let right = [
         format!("FILTER {}", pad.filter_kind.abbrev()),
         format!("CUTOFF {:04.0} HZ", pad.filter_cutoff),
+        format!("RES Q{:.2}", pad.filter_res),
     ];
     for (r, s) in right.iter().enumerate() {
         p.text(560, y0 + r as i32 * 24, s, 1, TEXT);
@@ -806,7 +840,7 @@ fn draw_edit(p: &mut dyn Painter, ui: &Ui, eng: &Engine) {
     p.text(
         24,
         606,
-        "B BROWSE  G CHOKE  F FILTER  K LOCK  UP/DN CUTOFF  1-8 SELECT+PLAY",
+        "B BROWSE  G CHOKE  F FILTER  M MONO  K LOCK  UP/DN CUTOFF  -/= RES  [/] PITCH  1-8 PLAY",
         1,
         DIM,
     );
@@ -819,7 +853,7 @@ mod tests {
 
     #[test]
     fn font_covers_needed_chars() {
-        for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -.:/%+<>()!?#=".chars() {
+        for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -.:/%+<>()!?#=[]".chars() {
             assert!(glyph(c).is_some(), "missing glyph for {c:?}");
         }
     }
@@ -940,6 +974,44 @@ mod tests {
     }
 
     #[test]
+    fn mono_pitch_res_keys() {
+        let mut eng = Engine::new();
+        let mut ui = Ui::new();
+        ui.page = Page::Edit;
+        let key = |kc| Event::KeyDown {
+            timestamp: 0,
+            window_id: 0,
+            keycode: Some(kc),
+            scancode: None,
+            keymod: sdl2::keyboard::Mod::NOMOD,
+            repeat: false,
+        };
+        // M toggles mono/poly.
+        handle_event(&mut ui, &mut eng, &key(Keycode::M));
+        assert!(eng.pads[0].mono);
+        handle_event(&mut ui, &mut eng, &key(Keycode::M));
+        assert!(!eng.pads[0].mono);
+        // [/] pitch in semitones.
+        handle_event(&mut ui, &mut eng, &key(Keycode::RightBracket));
+        handle_event(&mut ui, &mut eng, &key(Keycode::RightBracket));
+        assert!((eng.pads[0].tune_st - 2.0).abs() < 1e-6);
+        handle_event(&mut ui, &mut eng, &key(Keycode::LeftBracket));
+        assert!((eng.pads[0].tune_st - 1.0).abs() < 1e-6);
+        // -/= resonance.
+        let q0 = eng.pads[0].filter_res;
+        handle_event(&mut ui, &mut eng, &key(Keycode::Equals));
+        assert!(eng.pads[0].filter_res > q0);
+        handle_event(&mut ui, &mut eng, &key(Keycode::Minus));
+        assert!((eng.pads[0].filter_res - q0).abs() < 1e-6);
+        // Draw the edit page with the new params: no panic.
+        let mut surf = Surface::new(W, H, PixelFormatEnum::RGB24).unwrap();
+        {
+            let p: &mut dyn Painter = &mut surf;
+            draw(p, &ui, &eng);
+        }
+    }
+
+    #[test]
     fn panic_and_lock_keys() {
         let mut eng = Engine::new();
         let mut ui = Ui::new();
@@ -1055,3 +1127,4 @@ mod tests {
         }
     }
 }
+

@@ -266,9 +266,8 @@ fn print_help() {
     println!("keys: SPACE play/stop, T tap tempo, TAB sample editor, P panic, K lock pad,");
     println!("      S/E splice, D clear tape, W save project, 1-8 pads, F1-F3 presets,");
     println!("      arrows/comma/period adjust, ESC quit.");
-    println!(
-        "      editor: Z/X C/V trim, R reverse, N normalize, B browse, G choke, F filter, K lock."
-    );
+    println!("      editor: Z/X C/V trim, R reverse, N normalize, B browse, G choke, F filter,");
+    println!("      M mono/poly, K lock, up/down cutoff, -/= resonance, [/] pitch.");
     println!("      drop a .wav/.mp3 or .json file onto the window to load it.");
 }
 

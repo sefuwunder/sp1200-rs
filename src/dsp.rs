@@ -524,12 +524,13 @@ impl FilterKind {
     }
 }
 
-/// Biquad coefficients (RBJ cookbook, Q = 0.71): returns (b0,b1,b2),
-/// (a1,a2) with a0 normalized to 1. Cutoff is clamped to a sane range.
-pub fn biquad_coeffs(kind: FilterKind, cutoff_hz: f32, sr: f64) -> ([f32; 3], [f32; 2]) {
+/// Biquad coefficients (RBJ cookbook): returns (b0,b1,b2), (a1,a2)
+/// with a0 normalized to 1. Cutoff is clamped to a sane range, Q to
+/// 0.1..12.
+pub fn biquad_coeffs(kind: FilterKind, cutoff_hz: f32, q: f32, sr: f64) -> ([f32; 3], [f32; 2]) {
     let cutoff = cutoff_hz.clamp(40.0, 12000.0) as f64;
     let w0 = 2.0 * PI * cutoff / sr;
-    let q = 0.71;
+    let q = q.clamp(0.1, 12.0) as f64;
     let alpha = w0.sin() / (2.0 * q);
     let (b0, b1, b2, a0, a1, a2) = match kind {
         FilterKind::Lowpass => {
@@ -569,13 +570,13 @@ mod tests {
     #[test]
     fn biquad_lowpass_kills_highs_passes_lows() {
         for kind in [FilterKind::Lowpass, FilterKind::Highpass] {
-            let (b, a) = biquad_coeffs(kind, 1000.0, SP_RATE);
+            let (b, a) = biquad_coeffs(kind, 1000.0, 0.71, SP_RATE);
             for v in b.iter().chain(a.iter()) {
                 assert!(v.is_finite(), "non-finite coeff {v}");
             }
         }
         // 200 Hz sine through a 1 kHz lowpass: barely touched.
-        let (b, a) = biquad_coeffs(FilterKind::Lowpass, 1000.0, SP_RATE);
+        let (b, a) = biquad_coeffs(FilterKind::Lowpass, 1000.0, 0.71, SP_RATE);
         let mut st = [0.0f32; 4];
         let mut peak = 0.0f32;
         for n in 0..26040 {
@@ -598,8 +599,20 @@ mod tests {
     }
 
     #[test]
+    fn biquad_q_changes_coefficients() {
+        let (b1, a1) = biquad_coeffs(FilterKind::Lowpass, 1000.0, 0.71, SP_RATE);
+        let (b2, a2) = biquad_coeffs(FilterKind::Lowpass, 1000.0, 4.0, SP_RATE);
+        assert_ne!(b1, b2);
+        assert_ne!(a1, a2);
+        // Off stays a passthrough regardless of Q.
+        let (b, a) = biquad_coeffs(FilterKind::Off, 1000.0, 8.0, SP_RATE);
+        assert_eq!(b, [1.0, 0.0, 0.0]);
+        assert_eq!(a, [0.0, 0.0]);
+    }
+
+    #[test]
     fn biquad_highpass_kills_lows_passes_highs() {
-        let (b, a) = biquad_coeffs(FilterKind::Highpass, 1000.0, SP_RATE);
+        let (b, a) = biquad_coeffs(FilterKind::Highpass, 1000.0, 0.71, SP_RATE);
         let mut st = [0.0f32; 4];
         let mut peak = 0.0f32;
         for n in 0..26040 {

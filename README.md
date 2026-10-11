@@ -69,9 +69,12 @@ or loaded WAV). Edits are non-destructive except normalize.
 | `G` | Cycle choke group: `--` → `G1` → `G2` → `G3` → `G4` (pads in a group cut each other off, like open/closed hats) |
 | `F` | Cycle per-pad filter: `OFF` → `LP` → `HP` (resonant biquad, runs per voice) |
 | `↑` / `↓` | Filter cutoff, 80 Hz – 12 kHz |
+| `-` / `=` | Filter resonance (Q), 0.1 – 12 |
+| `M` | Mono/poly per pad: mono retriggering cuts the pad's own ringing voices |
+| `[` / `]` | Pad pitch −/+ 1 semitone (±24 st) |
 
 `sp1200-rs --pad 3 kick.wav` loads a WAV onto pad 3 at startup. Choke
-groups, filters, trim, reverse, and user samples are saved into native
+groups, filters (cutoff + resonance), mono/poly, pitch, trim, reverse, and user samples are saved into native
 projects (`W`); user samples are embedded as base64, so the project is
 self-contained.
 

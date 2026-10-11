@@ -37,10 +37,14 @@ pub struct Pad {
     pub custom: bool,
     pub filter_kind: FilterKind,
     pub filter_cutoff: f32,
+    /// Filter resonance (Q), 0.1..12.
+    pub filter_res: f32,
     /// Precomputed biquad coefficients (b0,b1,b2 / a1,a2), refreshed by
-    /// `set_filter`.
+    /// `set_filter` / `set_res`.
     pub fb: [f32; 3],
     pub fa: [f32; 2],
+    /// Mono: retriggering the pad cuts its own ringing voices.
+    pub mono: bool,
     pub choke: u8,
     /// Non-destructive edit region, fractions of `source`.
     pub trim: (f32, f32),
@@ -52,7 +56,7 @@ pub struct Pad {
 
 impl Pad {
     fn fresh(sample: Vec<i16>) -> Self {
-        let (fb, fa) = dsp::biquad_coeffs(FilterKind::Off, FILTER_DEFAULT_CUTOFF, SP_RATE);
+        let (fb, fa) = dsp::biquad_coeffs(FilterKind::Off, FILTER_DEFAULT_CUTOFF, 0.71, SP_RATE);
         Self {
             sample: sample.clone(),
             source: sample,
@@ -62,8 +66,10 @@ impl Pad {
             custom: false,
             filter_kind: FilterKind::Off,
             filter_cutoff: FILTER_DEFAULT_CUTOFF,
+            filter_res: 0.71,
             fb,
             fa,
+            mono: false,
             choke: 0,
             trim: (0.0, 1.0),
             reverse: false,
@@ -108,9 +114,14 @@ impl Pad {
         self.rebuild();
     }
 
-    /// Recompute biquad coefficients from kind + cutoff.
+    /// Recompute biquad coefficients from kind + cutoff + resonance.
     pub fn refresh_filter(&mut self) {
-        let (fb, fa) = dsp::biquad_coeffs(self.filter_kind, self.filter_cutoff, SP_RATE);
+        let (fb, fa) = dsp::biquad_coeffs(
+            self.filter_kind,
+            self.filter_cutoff,
+            self.filter_res,
+            SP_RATE,
+        );
         self.fb = fb;
         self.fa = fa;
     }
@@ -216,6 +227,14 @@ impl Engine {
     pub fn trigger(&mut self, pad: usize) {
         if pad >= N_PADS || self.pads[pad].sample.is_empty() {
             return;
+        }
+        // Mono: retriggering the pad cuts its own ringing voices.
+        if self.pads[pad].mono {
+            for v in self.voices.iter_mut() {
+                if v.active && v.pad == pad {
+                    v.active = false;
+                }
+            }
         }
         // Choke: pads sharing a group cut each other's voices.
         let g = self.pads[pad].choke;
@@ -469,6 +488,41 @@ impl Engine {
         let cutoff = (self.pads[i].filter_cutoff * factor).clamp(80.0, 12000.0);
         let kind = self.pads[i].filter_kind;
         self.set_filter(i, kind, cutoff);
+    }
+
+    /// Set the pad's filter resonance (Q), clamped 0.1..12.
+    pub fn set_res(&mut self, i: usize, q: f32) {
+        if i >= N_PADS {
+            return;
+        }
+        let p = &mut self.pads[i];
+        p.filter_res = q.clamp(0.1, 12.0);
+        p.refresh_filter();
+    }
+
+    /// Nudge the filter resonance multiplicatively (the UI's -/=).
+    pub fn nudge_res(&mut self, i: usize, up: bool) {
+        if i >= N_PADS {
+            return;
+        }
+        let factor = if up { 1.2 } else { 1.0 / 1.2 };
+        let q = (self.pads[i].filter_res * factor).clamp(0.1, 12.0);
+        self.set_res(i, q);
+    }
+
+    /// Nudge the pad's pitch in semitones, clamped -24..+24.
+    pub fn nudge_pitch(&mut self, i: usize, delta_st: f32) {
+        if i >= N_PADS {
+            return;
+        }
+        self.pads[i].tune_st = (self.pads[i].tune_st + delta_st).clamp(-24.0, 24.0);
+    }
+
+    /// Toggle mono/poly voice mode for a pad.
+    pub fn set_mono(&mut self, i: usize, mono: bool) {
+        if i < N_PADS {
+            self.pads[i].mono = mono;
+        }
     }
 
     /// Set the pad's choke group (0 = none).
@@ -770,6 +824,61 @@ pub fn load_tape_file(eng: &mut Engine, path: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mono_retrigger_cuts_own_voices_only() {
+        let mut e = Engine::new();
+        // Poly (default): voices stack.
+        e.trigger(0);
+        e.trigger(0);
+        assert_eq!(e.active_voices(), 2);
+        e.panic();
+        // Mono: the second hit kills the first.
+        e.set_mono(0, true);
+        e.trigger(0);
+        e.trigger(0);
+        assert_eq!(e.active_voices(), 1);
+        // Other pads are unaffected.
+        e.trigger(1);
+        assert_eq!(e.active_voices(), 2);
+        e.trigger(0);
+        assert_eq!(e.active_voices(), 2); // pad 0's voice replaced, pad 1 rings on
+    }
+
+    #[test]
+    fn pitch_nudge_clamps_and_changes_ratio() {
+        let mut e = Engine::new();
+        e.nudge_pitch(2, 12.0);
+        assert!((e.pads[2].tune_st - 12.0).abs() < 1e-6);
+        assert!((e.pads[2].ratio() - 2.0).abs() < 1e-9);
+        e.nudge_pitch(2, 100.0);
+        assert_eq!(e.pads[2].tune_st, 24.0);
+        e.nudge_pitch(2, -100.0);
+        assert_eq!(e.pads[2].tune_st, -24.0);
+        // Out-of-range pad index is a no-op, not a panic.
+        e.nudge_pitch(99, 1.0);
+        e.set_mono(99, true);
+        e.nudge_res(99, true);
+    }
+
+    #[test]
+    fn res_nudge_clamps_and_recomputes_coeffs() {
+        let mut e = Engine::new();
+        e.set_filter(3, FilterKind::Lowpass, 1000.0);
+        let before = e.pads[3].fb;
+        e.nudge_res(3, true);
+        assert!(e.pads[3].filter_res > 0.71);
+        assert_ne!(e.pads[3].fb, before);
+        e.set_res(3, 100.0);
+        assert_eq!(e.pads[3].filter_res, 12.0);
+        e.set_res(3, -5.0);
+        assert_eq!(e.pads[3].filter_res, 0.1);
+        // Render with high resonance: no panic, finite output.
+        e.trigger(3);
+        let mut out = vec![0.0f32; 2000];
+        e.render(&mut out);
+        assert!(out.iter().all(|v| v.is_finite()));
+    }
 
     #[test]
     fn panic_kills_all_voices_keeps_transport() {

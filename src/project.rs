@@ -133,6 +133,8 @@ pub struct NativePad {
     pub filter: String, // "off" | "lp" | "hp"
     #[serde(default = "def_cutoff")]
     pub cutoff: f32,
+    #[serde(default = "def_res")]
+    pub res: f32, // filter resonance (Q)
     #[serde(default)]
     pub choke: u8, // 0 = none
     #[serde(default = "def_trim")]
@@ -141,6 +143,8 @@ pub struct NativePad {
     pub reverse: bool,
     #[serde(default)]
     pub locked: bool,
+    #[serde(default)]
+    pub mono: bool,
     /// User-loaded sample (base64 LE i16, full source); absent for drums.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sample: Option<String>,
@@ -148,6 +152,10 @@ pub struct NativePad {
 
 fn def_cutoff() -> f32 {
     3000.0
+}
+
+fn def_res() -> f32 {
+    0.71
 }
 
 fn def_trim() -> [f32; 2] {
@@ -234,7 +242,9 @@ pub fn apply_native(eng: &mut Engine, p: &NativeProject) {
         eng.pads[i].reverse = pad.reverse;
         eng.pads[i].rebuild();
         eng.set_filter(i, FilterKind::from_str(&pad.filter), pad.cutoff);
+        eng.set_res(i, pad.res);
         eng.set_choke(i, pad.choke);
+        eng.set_mono(i, pad.mono);
         eng.pads[i].locked = pad.locked;
     }
     eng.patterns = p.pattern;
@@ -283,6 +293,8 @@ pub fn save_native(eng: &Engine, name: &str) -> String {
             label: p.label.clone(),
             filter: p.filter_kind.as_str().to_string(),
             cutoff: p.filter_cutoff,
+            res: p.filter_res,
+            mono: p.mono,
             choke: p.choke,
             trim: [p.trim.0, p.trim.1],
             reverse: p.reverse,
@@ -631,6 +643,8 @@ mod tests {
         e.pads[6].set_source(vec![11i16, -22, 33, -44], Some("WOBBLE".to_string()));
         e.pads[6].custom = true;
         e.set_locked(3, true);
+        e.set_res(2, 3.5);
+        e.set_mono(5, true);
         let json = save_native(&e, "design");
         assert!(json.contains("\"filter\": \"lp\""), "{json}");
         let p = parse_native(&json).unwrap();
@@ -638,6 +652,9 @@ mod tests {
         apply_native(&mut e2, &p);
         assert_eq!(e2.pads[2].filter_kind, FilterKind::Lowpass);
         assert!((e2.pads[2].filter_cutoff - 800.0).abs() < 1e-3);
+        assert!((e2.pads[2].filter_res - 3.5).abs() < 1e-6);
+        assert!(e2.pads[5].mono);
+        assert!(!e2.pads[0].mono);
         assert_eq!(e2.pads[5].filter_kind, FilterKind::Highpass);
         assert_eq!(e2.pads[4].choke, 2);
         assert_eq!(e2.pads[5].choke, 2);
