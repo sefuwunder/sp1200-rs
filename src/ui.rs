@@ -15,6 +15,7 @@ use sdl2::video::Window;
 use std::time::Instant;
 
 use crate::engine::{Engine, N_CHOKE_GROUPS, N_PADS, N_STEPS};
+use crate::fourtrack::{TrackSource, N_TRACKS};
 
 pub const W: u32 = 1024;
 pub const H: u32 = 640;
@@ -34,6 +35,7 @@ const STEP_ON: (u8, u8, u8) = (96, 70, 44);
 const STEP_OFF: (u8, u8, u8) = (36, 29, 22);
 const PLAYHEAD: (u8, u8, u8) = (255, 96, 64);
 const SEL: (u8, u8, u8) = (255, 157, 46);
+const REC: (u8, u8, u8) = (255, 64, 48);
 
 // ---------- 5x7 bitmap font ----------
 
@@ -186,6 +188,7 @@ fn hit_step(x: i32, y: i32) -> Option<usize> {
 pub enum Page {
     Pads,
     Edit,
+    Tape,
 }
 
 pub struct Browser {
@@ -342,12 +345,94 @@ pub fn handle_event(ui: &mut Ui, eng: &mut Engine, ev: &Event) -> bool {
                 if handled {
                     return false;
                 }
+            }
+            // 4-track tape page keys (Tab/Esc handled here too).
+            if ui.page == Page::Tape {
+                let has_input = eng.has_input();
+                let ft = &mut eng.four_track;
+                let handled = match *k {
+                    Keycode::Tab | Keycode::Escape => {
+                        ui.page = Page::Pads;
+                        true
+                    }
+                    Keycode::Num1 => {
+                        ft.select(0);
+                        true
+                    }
+                    Keycode::Num2 => {
+                        ft.select(1);
+                        true
+                    }
+                    Keycode::Num3 => {
+                        ft.select(2);
+                        true
+                    }
+                    Keycode::Num4 => {
+                        ft.select(3);
+                        true
+                    }
+                    Keycode::A => {
+                        let m = ft.toggle_arm();
+                        ui.say(m);
+                        true
+                    }
+                    Keycode::I => {
+                        let m = ft.toggle_source();
+                        ui.say(m);
+                        true
+                    }
+                    Keycode::M => {
+                        let m = ft.toggle_mute();
+                        ui.say(m);
+                        true
+                    }
+                    Keycode::X => {
+                        let m = ft.clear_selected();
+                        ui.say(m);
+                        true
+                    }
+                    Keycode::Return | Keycode::KpEnter => {
+                        let m = ft.toggle_play();
+                        ui.say(m);
+                        true
+                    }
+                    Keycode::R => {
+                        match ft.toggle_record() {
+                            Ok(m) => {
+                                if !has_input
+                                    && ft
+                                        .tracks
+                                        .iter()
+                                        .any(|t| t.armed && t.source == TrackSource::Input)
+                                {
+                                    ui.say(format!("{m} (NO INPUT DEVICE)"));
+                                } else {
+                                    ui.say(m);
+                                }
+                            }
+                            Err(e) => ui.say_err(e),
+                        }
+                        true
+                    }
+                    Keycode::S => {
+                        let m = ft.stop_rewind();
+                        ui.say(m);
+                        true
+                    }
+                    _ => false,
+                };
+                if handled {
+                    return false;
+                }
             } else if *k == Keycode::Tab {
                 ui.page = Page::Edit;
                 return false;
             }
             match *k {
                 Keycode::Escape | Keycode::Q => return true,
+                Keycode::A => {
+                    ui.page = Page::Tape;
+                }
                 Keycode::Space => {
                     if eng.playing {
                         eng.stop();
@@ -585,6 +670,10 @@ pub fn draw(p: &mut dyn Painter, ui: &Ui, eng: &Engine) {
         draw_edit(p, ui, eng);
         return;
     }
+    if ui.page == Page::Tape {
+        draw_tape(p, ui, eng);
+        return;
+    }
     p.rect(0, 0, W, H, BG);
     // header plate
     p.rect(0, 0, W, 76, PLATE);
@@ -694,7 +783,7 @@ pub fn draw(p: &mut dyn Painter, ui: &Ui, eng: &Engine) {
     p.text(
         24,
         584,
-        "SPACE PLAY/STOP  T TAP  TAB EDIT  P PANIC  K LOCK  S/E SPLICE  D TAPE OFF  W SAVE  ESC QUIT",
+        "SPACE PLAY/STOP  T TAP  TAB EDIT  A 4-TRACK  P PANIC  K LOCK  S/E SPLICE  D TAPE OFF  W SAVE  ESC QUIT",
         1,
         DIM,
     );
@@ -705,6 +794,118 @@ pub fn draw(p: &mut dyn Painter, ui: &Ui, eng: &Engine) {
         1,
         DIM,
     );
+}
+
+fn draw_tape(p: &mut dyn Painter, ui: &Ui, eng: &Engine) {
+    use crate::dsp::SP_RATE;
+    p.rect(0, 0, W, H, BG);
+    p.rect(0, 0, W, 76, PLATE);
+    p.text(24, 22, "SP-1200 RS", 3, TEXT);
+    p.text(24, 52, "4-TRACK TAPE", 1, DIM);
+
+    let ft = &eng.four_track;
+    // Transport status, top-right.
+    let st = ft.status();
+    let stc = if ft.recording { REC } else { TEXT };
+    let secs = ft.playhead as f32 / SP_RATE as f32;
+    let time = format!("{:02}:{:04.1}", (secs / 60.0) as u32, secs % 60.0);
+    let in_s = if eng.has_input() { "IN OK" } else { "IN NONE" };
+    let mut rx = W as i32 - 24;
+    for (s, c) in [(time.as_str(), TEXT), (in_s, DIM), (st, stc)] {
+        let w = text_w(s, 2) as i32;
+        rx -= w;
+        p.text(rx, 26, s, 2, c);
+        rx -= 24;
+    }
+
+    // Track strips.
+    for t in 0..N_TRACKS {
+        let tr = &ft.tracks[t];
+        let y0 = 100 + t as i32 * 112;
+        if t == ft.selected {
+            p.rect(16, y0 - 8, W - 32, 104, PLATE);
+        }
+        // REC dot for armed tracks.
+        if tr.armed {
+            let c = if ft.recording { REC } else { DIM };
+            p.rect(24, y0 + 4, 10, 10, c);
+        }
+        p.text(
+            44,
+            y0,
+            &format!("TRACK {}", t + 1),
+            2,
+            if t == ft.selected { TEXT } else { DIM },
+        );
+        let mut sy = y0 + 30;
+        p.text(
+            44,
+            sy,
+            &format!(
+                "{}  {}  {}",
+                if tr.armed { "ARMED" } else { "SAFE" },
+                tr.source.label(),
+                if tr.muted { "MUTED" } else { "" },
+            ),
+            1,
+            DIM,
+        );
+        sy += 22;
+        p.text(44, sy, &format!("{:.1}S", tr.len_secs()), 1, DIM);
+
+        // Waveform overview.
+        let (wx, wy, ww, wh) = (300i32, y0, 700u32, 88u32);
+        p.rect(wx, wy, ww, wh, BG);
+        let mid = wy + wh as i32 / 2;
+        let amp = wh as f32 / 2.0 - 2.0;
+        if tr.samples.is_empty() {
+            p.rect(wx, mid, ww, 1, DIM);
+        } else {
+            let n = tr.samples.len();
+            for cx in 0..ww {
+                let a = (cx as usize * n) / ww as usize;
+                let b = (((cx as usize + 1) * n) / ww as usize).max(a + 1).min(n);
+                let step = ((b - a) / 64).max(1);
+                let mut mn = f32::INFINITY;
+                let mut mx = f32::NEG_INFINITY;
+                for s in tr.samples[a..b].iter().step_by(step) {
+                    if *s < mn {
+                        mn = *s;
+                    }
+                    if *s > mx {
+                        mx = *s;
+                    }
+                }
+                let y1 = mid - (mx * amp) as i32;
+                let y2 = mid - (mn * amp) as i32;
+                let (y1, y2) = (y1.min(y2), y1.max(y2));
+                p.rect(wx + cx as i32, y1, 1, (y2 - y1).max(1) as u32, DIM);
+            }
+        }
+        // Playhead marker.
+        if !tr.samples.is_empty() {
+            let px = wx
+                + ((ft.playhead.min(tr.samples.len()) as u64 * ww as u64) / tr.samples.len() as u64)
+                    as i32;
+            p.rect(px, wy, 2, wh, PLAYHEAD);
+        }
+    }
+
+    p.text(
+        24,
+        580,
+        "1-4 SELECT  A ARM  I INPUT/MASTER  M MUTE  X CLEAR TRACK",
+        1,
+        DIM,
+    );
+    p.text(
+        24,
+        602,
+        "ENTER PLAY/STOP  R RECORD  S REWIND  SPACE PATTERN  TAB PADS",
+        1,
+        DIM,
+    );
+    draw_msg(p, ui);
 }
 
 fn draw_msg(p: &mut dyn Painter, ui: &Ui) {
@@ -974,6 +1175,68 @@ mod tests {
     }
 
     #[test]
+    fn four_track_page_keys() {
+        let mut eng = Engine::new();
+        let mut ui = Ui::new();
+        let key = |kc| Event::KeyDown {
+            timestamp: 0,
+            window_id: 0,
+            keycode: Some(kc),
+            scancode: None,
+            keymod: sdl2::keyboard::Mod::NOMOD,
+            repeat: false,
+        };
+        // A opens the 4-track page from the pads page.
+        handle_event(&mut ui, &mut eng, &key(Keycode::A));
+        assert!(matches!(ui.page, Page::Tape));
+        // 1-4 select tracks; A/I/M arm/source/mute the selected one.
+        handle_event(&mut ui, &mut eng, &key(Keycode::Num3));
+        assert_eq!(eng.four_track.selected, 2);
+        handle_event(&mut ui, &mut eng, &key(Keycode::A));
+        assert!(eng.four_track.tracks[2].armed);
+        handle_event(&mut ui, &mut eng, &key(Keycode::I));
+        assert_eq!(
+            eng.four_track.tracks[2].source,
+            crate::fourtrack::TrackSource::Input
+        );
+        handle_event(&mut ui, &mut eng, &key(Keycode::M));
+        assert!(eng.four_track.tracks[2].muted);
+        // R without an armed MASTER... track 3 is armed (INPUT): records.
+        handle_event(&mut ui, &mut eng, &key(Keycode::R));
+        assert!(eng.four_track.recording);
+        assert!(eng.four_track.playing);
+        handle_event(&mut ui, &mut eng, &key(Keycode::R));
+        assert!(!eng.four_track.recording);
+        // Enter toggles play; S rewinds.
+        handle_event(&mut ui, &mut eng, &key(Keycode::Return));
+        assert!(!eng.four_track.playing);
+        handle_event(&mut ui, &mut eng, &key(Keycode::Return));
+        assert!(eng.four_track.playing);
+        handle_event(&mut ui, &mut eng, &key(Keycode::S));
+        assert!(!eng.four_track.playing);
+        assert_eq!(eng.four_track.playhead, 0);
+        // X clears the selected track.
+        eng.four_track.tracks[2].samples = vec![0.1; 10];
+        handle_event(&mut ui, &mut eng, &key(Keycode::X));
+        assert!(eng.four_track.tracks[2].samples.is_empty());
+        // Tab goes back to pads; A on the tape page arms (doesn't reopen).
+        handle_event(&mut ui, &mut eng, &key(Keycode::Tab));
+        assert!(matches!(ui.page, Page::Pads));
+        // Pads 1-4 still trigger pads on the pads page (no tape hijack).
+        handle_event(&mut ui, &mut eng, &key(Keycode::Num1));
+        assert_eq!(eng.active_voices(), 1);
+        // Draw the tape page with content: no panic.
+        eng.four_track.tracks[0].samples = vec![0.2; 5000];
+        eng.four_track.tracks[1].samples = vec![-0.3; 200];
+        ui.page = Page::Tape;
+        let mut surf = Surface::new(W, H, PixelFormatEnum::RGB24).unwrap();
+        {
+            let p: &mut dyn Painter = &mut surf;
+            draw(p, &ui, &eng);
+        }
+    }
+
+    #[test]
     fn mono_pitch_res_keys() {
         let mut eng = Engine::new();
         let mut ui = Ui::new();
@@ -1127,4 +1390,3 @@ mod tests {
         }
     }
 }
-

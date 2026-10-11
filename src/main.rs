@@ -14,6 +14,7 @@ mod audio;
 mod decode;
 mod dsp;
 mod engine;
+mod fourtrack;
 mod project;
 mod ui;
 mod wav;
@@ -177,6 +178,19 @@ fn run_app_for(
         }
     };
 
+    // Live input for the 4-track: best-effort, the app works without it.
+    let _capture = match audio::open_capture_device(&audio_sub) {
+        Ok((dev, queue, rate)) => {
+            engine.lock().unwrap().set_capture_input(queue, rate);
+            println!("input device: {rate:.0} Hz");
+            Some(dev)
+        }
+        Err(e) => {
+            eprintln!("no input device ({e}); INPUT tracks will record silence");
+            None
+        }
+    };
+
     let mut ui = Ui::new();
     if let Some(d) = samples_dir {
         ui.samples_dir = d;
@@ -263,11 +277,13 @@ fn print_help() {
     println!("                             render the fixed demo pattern to WAV");
     println!("  sp1200-rs --shot out.bmp   render one UI frame offscreen to BMP");
     println!("  sp1200-rs --smoke [secs]   run the UI headless for N seconds, exit 0");
-    println!("keys: SPACE play/stop, T tap tempo, TAB sample editor, P panic, K lock pad,");
-    println!("      S/E splice, D clear tape, W save project, 1-8 pads, F1-F3 presets,");
-    println!("      arrows/comma/period adjust, ESC quit.");
+    println!("keys: SPACE play/stop, T tap tempo, TAB sample editor, A 4-track, P panic,");
+    println!("      K lock pad, S/E splice, D clear tape, W save project, 1-8 pads,");
+    println!("      F1-F3 presets, arrows/comma/period adjust, ESC quit.");
     println!("      editor: Z/X C/V trim, R reverse, N normalize, B browse, G choke, F filter,");
     println!("      M mono/poly, K lock, up/down cutoff, -/= resonance, [/] pitch.");
+    println!("      4-track: 1-4 select, A arm, I input/master, M mute, X clear,");
+    println!("      ENTER play/stop, R record, S rewind.");
     println!("      drop a .wav/.mp3 or .json file onto the window to load it.");
 }
 

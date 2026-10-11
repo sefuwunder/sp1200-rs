@@ -73,6 +73,20 @@ or loaded WAV). Edits are non-destructive except normalize.
 | `M` | Mono/poly per pad: mono retriggering cuts the pad's own ringing voices |
 | `[` / `]` | Pad pitch −/+ 1 semitone (±24 st) |
 
+### 4-track tape
+
+`A` opens the 4-track page: four mono tracks for recording live input
+(the default audio capture device — mic/line-in) or bouncing the pattern
+mix. Each track has `A` arm, `I` input/master source, `M` mute, `X` clear;
+`1-4` selects the track. `ENTER` plays/stops the tape, `R` toggles
+recording on armed tracks (starting playback), `S` stops and rewinds.
+`SPACE` still runs the pattern sequencer, so bouncing is: arm a track with
+`MASTER` source, hit `R`, hit `SPACE`, hit `R` again. Recording is
+punch-in style — the armed region is replaced, and armed tracks aren't
+played back while recording (no feedback). The header shows `IN OK` /
+`IN NONE` for the capture device. Track audio and settings are saved into
+native projects.
+
 `sp1200-rs --pad 3 kick.wav` loads a WAV onto pad 3 at startup. Choke
 groups, filters (cutoff + resonance), mono/poly, pitch, trim, reverse, and user samples are saved into native
 projects (`W`); user samples are embedded as base64, so the project is

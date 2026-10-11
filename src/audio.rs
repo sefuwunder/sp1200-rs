@@ -2,6 +2,7 @@
 //! linearly to the device rate (44100 Hz requested for compatibility).
 
 use sdl2::audio::{AudioCallback, AudioSpecDesired};
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use crate::dsp::SP_RATE;
@@ -75,4 +76,47 @@ pub fn open_device(
     })?;
     device.resume();
     Ok(device)
+}
+
+/// Capture callback: SDL hands us the recorded samples in `input`;
+/// we push them into the shared queue for the engine to drain.
+pub struct CaptureCallback {
+    queue: Arc<Mutex<VecDeque<f32>>>,
+}
+
+impl AudioCallback for CaptureCallback {
+    type Channel = f32;
+
+    fn callback(&mut self, input: &mut [f32]) {
+        // Never block the capture thread: drop the block on contention.
+        if let Ok(mut q) = self.queue.try_lock() {
+            q.extend(input.iter().copied());
+        }
+    }
+}
+
+/// Best-effort: open the default capture device (mic/line-in), 44.1 kHz
+/// mono. Returns the device (keep it alive), the sample queue, and the
+/// device's actual rate. Fails cleanly when no input device exists.
+pub fn open_capture_device(
+    audio: &sdl2::AudioSubsystem,
+) -> Result<
+    (
+        sdl2::audio::AudioDevice<CaptureCallback>,
+        Arc<Mutex<VecDeque<f32>>>,
+        f64,
+    ),
+    String,
+> {
+    let queue = Arc::new(Mutex::new(VecDeque::new()));
+    let q2 = Arc::clone(&queue);
+    let spec = AudioSpecDesired {
+        freq: Some(44100),
+        channels: Some(1),
+        samples: Some(1024),
+    };
+    let device = audio.open_capture(None, &spec, |_| CaptureCallback { queue: q2 })?;
+    let rate = device.spec().freq as f64;
+    device.resume();
+    Ok((device, queue, rate))
 }

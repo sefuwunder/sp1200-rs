@@ -92,12 +92,36 @@ pub fn pcm16_b64_to_f32(b64: &str) -> Result<Vec<f32>, String> {
         .collect())
 }
 
+/// base64 of little-endian f32 → String (for embedding 4-track audio).
+pub fn f32_b64_encode(samples: &[f32]) -> String {
+    let mut bytes = Vec::with_capacity(samples.len() * 4);
+    for v in samples {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    b64_encode_bytes(&bytes)
+}
+
+pub fn f32_b64_decode(s: &str) -> Result<Vec<f32>, String> {
+    let bytes = b64_decode(s)?;
+    if bytes.len() % 4 != 0 {
+        return Err("bad f32 audio length".to_string());
+    }
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
+}
+
 /// base64 of little-endian i16 → String (for embedding pad samples).
 pub fn pcm16_b64_encode(samples: &[i16]) -> String {
     let mut bytes = Vec::with_capacity(samples.len() * 2);
     for s in samples {
         bytes.extend_from_slice(&s.to_le_bytes());
     }
+    b64_encode_bytes(&bytes)
+}
+
+fn b64_encode_bytes(bytes: &[u8]) -> String {
     let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
     for ch in bytes.chunks(3) {
         let n = (ch[0] as u32) << 16
@@ -168,6 +192,23 @@ pub struct NativeTape {
     pub chops: Vec<[usize; 2]>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct NativeTrack {
+    /// base64 LE f32 mono @ SP_RATE; absent for empty tracks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio: Option<String>,
+    #[serde(default)]
+    pub armed: bool,
+    #[serde(default)]
+    pub muted: bool,
+    #[serde(default = "def_track_source")]
+    pub source: String, // "input" | "master"
+}
+
+fn def_track_source() -> String {
+    "master".to_string()
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 pub struct NativeProject {
     pub format: String, // "sp1200-rs"
@@ -184,6 +225,9 @@ pub struct NativeProject {
     pub pattern: [[bool; 16]; 8],
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tape: Option<NativeTape>,
+    /// 4-track tape; empty in older files.
+    #[serde(default)]
+    pub four_track: Vec<NativeTrack>,
 }
 
 fn def_bpm() -> f64 {
@@ -248,6 +292,32 @@ pub fn apply_native(eng: &mut Engine, p: &NativeProject) {
         eng.pads[i].locked = pad.locked;
     }
     eng.patterns = p.pattern;
+    // 4-track: restore audio + settings (transport always starts stopped).
+    {
+        use crate::fourtrack::TrackSource;
+        let ft = &mut eng.four_track;
+        for t in ft.tracks.iter_mut() {
+            t.samples.clear();
+            t.armed = false;
+            t.muted = false;
+            t.source = TrackSource::Master;
+        }
+        for (i, nt) in p.four_track.iter().enumerate().take(4) {
+            let t = &mut ft.tracks[i];
+            t.armed = nt.armed;
+            t.muted = nt.muted;
+            t.source = TrackSource::from_str(&nt.source);
+            if let Some(a) = &nt.audio {
+                if let Ok(v) = f32_b64_decode(a) {
+                    t.samples = v;
+                }
+            }
+        }
+        ft.playhead = 0;
+        ft.playing = false;
+        ft.recording = false;
+        ft.selected = 0;
+    }
     match &p.tape {
         Some(t) => {
             let chops: Vec<(usize, usize)> = t
@@ -310,6 +380,21 @@ pub fn save_native(eng: &Engine, name: &str) -> String {
         name: t.name.clone(),
         chops: t.chops.iter().map(|&(a, b)| [a, b]).collect(),
     });
+    let four_track = eng
+        .four_track
+        .tracks
+        .iter()
+        .map(|t| NativeTrack {
+            audio: if t.samples.is_empty() {
+                None
+            } else {
+                Some(f32_b64_encode(&t.samples))
+            },
+            armed: t.armed,
+            muted: t.muted,
+            source: t.source.as_str().to_string(),
+        })
+        .collect();
     let p = NativeProject {
         format: "sp1200-rs".to_string(),
         version: 1,
@@ -320,6 +405,7 @@ pub fn save_native(eng: &Engine, name: &str) -> String {
         pads,
         pattern: eng.patterns,
         tape,
+        four_track,
     };
     serde_json::to_string_pretty(&p).unwrap_or_else(|_| "{}".to_string())
 }
@@ -645,6 +731,20 @@ mod tests {
         e.set_locked(3, true);
         e.set_res(2, 3.5);
         e.set_mono(5, true);
+        // 4-track: bounce a block of "pattern" onto track 1.
+        e.four_track.toggle_arm();
+        e.four_track.toggle_record().unwrap();
+        let mut blk = vec![0.0f32; 64];
+        e.render(&mut blk); // no pattern playing: renders near-silence
+        e.trigger(0);
+        e.render(&mut blk); // now the master block carries pad 1
+        e.four_track.toggle_record().unwrap();
+        let take = e.four_track.tracks[0].samples.clone();
+        assert!(!take.is_empty());
+        e.four_track.select(1);
+        e.four_track.toggle_mute();
+        e.four_track.toggle_source(); // -> INPUT
+        e.four_track.stop_rewind();
         let json = save_native(&e, "design");
         assert!(json.contains("\"filter\": \"lp\""), "{json}");
         let p = parse_native(&json).unwrap();
@@ -655,6 +755,16 @@ mod tests {
         assert!((e2.pads[2].filter_res - 3.5).abs() < 1e-6);
         assert!(e2.pads[5].mono);
         assert!(!e2.pads[0].mono);
+        // 4-track round-trips (audio + settings).
+        assert_eq!(e2.four_track.tracks[0].samples, take);
+        assert!(e2.four_track.tracks[0].armed);
+        assert!(e2.four_track.tracks[1].muted);
+        assert_eq!(
+            e2.four_track.tracks[1].source,
+            crate::fourtrack::TrackSource::Input
+        );
+        assert!(!e2.four_track.playing);
+        assert!(!e2.four_track.recording);
         assert_eq!(e2.pads[5].filter_kind, FilterKind::Highpass);
         assert_eq!(e2.pads[4].choke, 2);
         assert_eq!(e2.pads[5].choke, 2);

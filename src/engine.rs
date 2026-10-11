@@ -5,6 +5,9 @@
 //! can be byte-compared against the JS reference.
 
 use crate::dsp::{self, js_round, FilterKind, XorShift32, DRUM_NAMES, SP_RATE};
+use crate::fourtrack::{FourTrack, TrackSource};
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
 pub const N_PADS: usize = 8;
 pub const N_STEPS: usize = 16;
@@ -188,6 +191,18 @@ pub struct Engine {
     /// Drum-mode samples (synths, or web-imported customs): what pads
     /// revert to when the tape is cleared.
     pub(crate) pad_factory: Vec<Vec<i16>>,
+    /// 4-track tape recorder (live input / pattern bounces).
+    pub four_track: FourTrack,
+    /// Live-input capture queue (None when no input device was found).
+    capture: Option<CaptureInput>,
+    /// Fractional resample position into the capture queue.
+    cap_phase: f64,
+}
+
+/// Live audio input from the SDL2 capture device.
+struct CaptureInput {
+    queue: Arc<Mutex<VecDeque<f32>>>,
+    rate: f64,
 }
 
 impl Engine {
@@ -219,6 +234,9 @@ impl Engine {
             tape: None,
             chop_map: [None; N_PADS],
             pad_factory,
+            four_track: FourTrack::new(),
+            capture: None,
+            cap_phase: 0.0,
         };
         e.apply_preset(0);
         e
@@ -610,6 +628,50 @@ impl Engine {
     }
 
     /// Render `out.len()` samples @ 26.04 kHz into `out` (-1.0..1.0).
+    /// Attach the live-input capture queue (best-effort, from the SDL2
+    /// capture device). Until this is called, INPUT tracks record silence.
+    pub fn set_capture_input(&mut self, queue: Arc<Mutex<VecDeque<f32>>>, rate: f64) {
+        self.capture = Some(CaptureInput { queue, rate });
+    }
+
+    pub fn has_input(&self) -> bool {
+        self.capture.is_some()
+    }
+
+    /// Drain the capture queue, resampling to SP_RATE. Underruns emit
+    /// silence without advancing, so the recording stays in sync.
+    fn drain_capture(&mut self, n: usize) -> Vec<f32> {
+        let (rate, queue) = match &self.capture {
+            Some(c) => (c.rate, Arc::clone(&c.queue)),
+            None => return vec![0.0; n],
+        };
+        let mut q = queue.lock().unwrap();
+        // Bound memory: drop oldest beyond 4 s of audio.
+        let maxq = (rate * 4.0) as usize;
+        if q.len() > maxq {
+            let drop = q.len() - maxq;
+            q.drain(..drop);
+            self.cap_phase = (self.cap_phase - drop as f64).max(0.0);
+        }
+        let step = rate / SP_RATE;
+        let mut out = Vec::with_capacity(n);
+        let mut pos = self.cap_phase;
+        for _ in 0..n {
+            let i0 = pos as usize;
+            if i0 + 1 >= q.len() {
+                out.push(0.0);
+                continue;
+            }
+            let f = (pos - i0 as f64) as f32;
+            out.push(q[i0] + (q[i0 + 1] - q[i0]) * f);
+            pos += step;
+        }
+        let consumed = (pos as usize).min(q.len());
+        q.drain(..consumed);
+        self.cap_phase = pos - consumed as f64;
+        out
+    }
+
     pub fn render(&mut self, out: &mut [f32]) {
         let d = dsp::sixteenth_dur(self.bpm);
         for s in out.iter_mut() {
@@ -649,6 +711,35 @@ impl Engine {
             }
             *s = (mix * self.master).clamp(-1.0, 1.0);
             self.clock += 1;
+        }
+        // 4-track tape: playback + recording. The bounce source is the
+        // voice/pattern mix captured above, before tape playback is added.
+        if self.four_track.playing || self.four_track.recording {
+            let n = out.len();
+            let rec = self.four_track.recording;
+            let need_input = rec
+                && self
+                    .four_track
+                    .tracks
+                    .iter()
+                    .any(|t| t.armed && t.source == TrackSource::Input);
+            let need_master = rec
+                && self
+                    .four_track
+                    .tracks
+                    .iter()
+                    .any(|t| t.armed && t.source == TrackSource::Master);
+            let input = if need_input {
+                self.drain_capture(n)
+            } else {
+                Vec::new()
+            };
+            let master = if need_master {
+                Some(out.to_vec())
+            } else {
+                None
+            };
+            self.four_track.process(out, &input, master.as_deref());
         }
     }
 
