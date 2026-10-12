@@ -2,8 +2,9 @@
 //!
 //! Two formats:
 //! - **Native** `sp1200-rs` JSON (versioned, we define it): kit + step
-//!   pattern + tape chop markers. Tape *audio* is not embedded — drop the
-//!   .wav after loading and the saved chops apply to it.
+//!   pattern + pad samples + tape audio and chop markers. Projects are
+//!   self-contained: reloading one restores the exact pad sounds without
+//!   needing the original .wav files.
 //! - **Web import**: the browser app's `.sp1200.json`
 //!   (`serializeProject`/`loadProjectData` in the web `app.js`): bpm/swing/
 //!   master, per-pad tune/level/label, custom pad samples (base64 pcm16),
@@ -169,7 +170,8 @@ pub struct NativePad {
     pub locked: bool,
     #[serde(default)]
     pub mono: bool,
-    /// User-loaded sample (base64 LE i16, full source); absent for drums.
+    /// User-loaded sample (base64 LE i16, full drum-mode source); absent
+    /// for drums.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sample: Option<String>,
 }
@@ -190,6 +192,10 @@ fn def_trim() -> [f32; 2] {
 pub struct NativeTape {
     pub name: String,
     pub chops: Vec<[usize; 2]>,
+    /// Tape audio (base64 LE i16 @ SP_RATE). Absent in older files, which
+    /// load markers-only (drop the .wav after loading, as before).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -325,15 +331,47 @@ pub fn apply_native(eng: &mut Engine, p: &NativeProject) {
     }
     match &p.tape {
         Some(t) => {
-            let chops: Vec<(usize, usize)> = t
-                .chops
-                .iter()
-                .map(|&[a, b]| (a.min(b), b.max(a)))
-                .filter(|&(a, b)| b > a)
-                .collect();
+            let audio: Vec<i16> = t
+                .audio
+                .as_ref()
+                .and_then(|b64| b64_decode(b64).ok())
+                .and_then(|bytes| {
+                    if bytes.len() % 2 == 0 && !bytes.is_empty() {
+                        Some(
+                            bytes
+                                .chunks_exact(2)
+                                .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                                .collect(),
+                        )
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default();
+            let n = audio.len();
+            // Chops are sample offsets: clamp/drop against the audio so a
+            // corrupt file can never panic the player. Older markers-only
+            // files (no audio) keep their chops verbatim.
+            let mut chops: Vec<(usize, usize)> = Vec::with_capacity(t.chops.len());
+            for &[a, b] in &t.chops {
+                let (a, mut b) = (a.min(b), b.max(a));
+                if b <= a {
+                    continue;
+                }
+                if n > 0 {
+                    if a >= n {
+                        continue;
+                    }
+                    b = b.min(n);
+                    if b <= a {
+                        continue;
+                    }
+                }
+                chops.push((a, b));
+            }
             eng.tape = Some(Tape {
                 name: t.name.clone(),
-                audio: Vec::new(), // markers only; drop the .wav to fill
+                audio,
                 chops,
             });
         }
@@ -374,8 +412,11 @@ pub fn save_native(eng: &Engine, name: &str) -> String {
             trim: [p.trim.0, p.trim.1],
             reverse: p.reverse,
             locked: p.locked,
+            // The custom drum-mode sample, not the live `source`: when a
+            // tape is loaded the source is chop audio, and saving that
+            // would permanently replace the user's sample on reload.
             sample: if p.custom {
-                Some(pcm16_b64_encode(&p.source))
+                Some(pcm16_b64_encode(&eng.pad_factory[i]))
             } else {
                 None
             },
@@ -384,6 +425,11 @@ pub fn save_native(eng: &Engine, name: &str) -> String {
     let tape = eng.tape.as_ref().map(|t| NativeTape {
         name: t.name.clone(),
         chops: t.chops.iter().map(|&(a, b)| [a, b]).collect(),
+        audio: if t.audio.is_empty() {
+            None
+        } else {
+            Some(pcm16_b64_encode(&t.audio))
+        },
     });
     let four_track = eng
         .four_track
@@ -732,8 +778,7 @@ mod tests {
         e.set_choke(5, 2);
         e.nudge_trim(1, 0, 0.25);
         e.toggle_reverse(1);
-        e.pads[6].set_source(vec![11i16, -22, 33, -44], Some("WOBBLE".to_string()));
-        e.pads[6].custom = true;
+        e.set_custom_pad(6, vec![11i16, -22, 33, -44], Some("WOBBLE".to_string()));
         e.set_locked(3, true);
         e.set_res(2, 3.5);
         e.set_mono(5, true);
@@ -834,6 +879,98 @@ mod tests {
         assert!(t.audio.is_empty());
         // And it serializes back identically.
         assert_eq!(save_native(&e2, "roundtrip"), json);
+    }
+
+    #[test]
+    fn native_round_trip_tape_audio() {
+        // Tape audio is embedded now: pads playing chops survive save/load.
+        let mut e = Engine::new();
+        let audio: Vec<i16> = (0..3000).map(|i| (i % 251) as i16 - 125).collect();
+        e.tape = Some(Tape {
+            name: "LOOP".to_string(),
+            audio: audio.clone(),
+            chops: vec![(0, 1000), (1000, 3000)],
+        });
+        e.refresh_pad_samples();
+        assert_eq!(e.pads[0].source, audio[0..1000].to_vec());
+        assert_eq!(e.pads[1].source, audio[1000..3000].to_vec());
+
+        let json = save_native(&e, "tapey");
+        assert!(json.contains("\"audio\""), "tape audio embedded");
+        let p = parse_native(&json).unwrap();
+        let mut e2 = Engine::new();
+        apply_native(&mut e2, &p);
+        let t = e2.tape.as_ref().unwrap();
+        assert_eq!(t.audio, audio);
+        assert_eq!(t.chops, vec![(0, 1000), (1000, 3000)]);
+        // Pads rebuilt from the embedded chops.
+        assert_eq!(e2.pads[0].source, audio[0..1000].to_vec());
+        assert_eq!(e2.pads[1].source, audio[1000..3000].to_vec());
+        assert_eq!(e2.chop_map[0], Some(0));
+        assert_eq!(e2.chop_map[1], Some(1));
+        // Full loop: serializes back identically.
+        assert_eq!(save_native(&e2, "tapey"), json);
+    }
+
+    #[test]
+    fn native_custom_pad_with_tape_saves_factory_sample() {
+        // A custom pad playing a chop must save its drum-mode sample, not
+        // the chop audio it happens to be playing.
+        let mut e = Engine::new();
+        let custom: Vec<i16> = vec![1111; 500];
+        e.set_custom_pad(2, custom.clone(), Some("MINE".to_string()));
+        let audio: Vec<i16> = (0..2000).map(|i| (i % 97) as i16).collect();
+        e.tape = Some(Tape {
+            name: "T".to_string(),
+            audio: audio.clone(),
+            chops: vec![(0, 500), (500, 1500), (1500, 2000)],
+        });
+        e.refresh_pad_samples();
+        // Pad 3 now plays chop 3's audio (pad i defaults to chop i)...
+        assert_eq!(e.pads[2].source, audio[1500..2000].to_vec());
+        assert!(e.pads[2].custom);
+        assert_ne!(e.pads[2].source, custom);
+
+        let json = save_native(&e, "mix");
+        let p = parse_native(&json).unwrap();
+        let saved: Vec<i16> = {
+            let b64 = p.pads[2].sample.as_ref().expect("custom pad saved");
+            let bytes = b64_decode(b64).unwrap();
+            bytes
+                .chunks_exact(2)
+                .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                .collect()
+        };
+        assert_eq!(saved, custom, "saved the drum-mode sample, not chop audio");
+
+        let mut e2 = Engine::new();
+        apply_native(&mut e2, &p);
+        // Drum-mode sample survived...
+        assert_eq!(e2.pad_factory[2], custom);
+        assert!(e2.pads[2].custom);
+        // ...and with the embedded tape the pad still plays its chop.
+        assert_eq!(e2.pads[2].source, audio[1500..2000].to_vec());
+    }
+
+    #[test]
+    fn native_tape_chops_validated_against_audio() {
+        // Corrupt chop offsets can never panic the player.
+        let mut e = Engine::new();
+        e.tape = Some(Tape {
+            name: "T".to_string(),
+            audio: vec![7; 100],
+            chops: vec![(0, 50), (40, 5000), (9000, 9500), (70, 70)],
+        });
+        let json = save_native(&e, "clamp");
+        let p = parse_native(&json).unwrap();
+        let mut e2 = Engine::new();
+        apply_native(&mut e2, &p); // must not panic
+        let t = e2.tape.as_ref().unwrap();
+        assert_eq!(t.chops, vec![(0, 50), (40, 100)]);
+        // Playing a pad on a clamped chop must not panic either.
+        e2.trigger(1);
+        let mut blk = vec![0.0f32; 64];
+        e2.render(&mut blk);
     }
 
     #[test]
