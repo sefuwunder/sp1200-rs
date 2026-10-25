@@ -108,7 +108,8 @@ Trim is a non-destructive playback window per track: `,` / `.` nudge the
 selected track's trim start, `;` / `'` its trim end, in 0.1 s steps — a
 trimmed track stays silent outside its window, and trimming never deletes
 audio. `B` resamples the selected track's trimmed region onto the
-same-number pad through the 12-bit path (track 1 → pad 1); the pad keeps
+same-number pad through the 12-bit path (track 1 → pad 1), printing
+the current tape-bus warmth/distortion into the bounce; the pad keeps
 the resample as its custom sound, so `W` saves it and tape-clear restores
 it.
 

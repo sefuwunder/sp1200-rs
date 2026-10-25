@@ -664,6 +664,9 @@ impl Engine {
         if region.is_empty() {
             return Err(format!("TRACK {} EMPTY (OR TRIM EMPTY)", track + 1));
         }
+        // Print the tape-bus character into the bounce: the pad gets
+        // what the tape section sounds like, not the dry take.
+        let region = self.four_track.print_bus(&region);
         let audio = dsp::quantize12_i16(&region);
         let secs = audio.len() as f32 / SP_RATE as f32;
         self.chop_map[pad] = None;
@@ -1314,6 +1317,38 @@ mod tests {
         assert!(e.resample_track_to_pad(0, 0).is_err());
         assert!(e.resample_track_to_pad(4, 0).is_err());
         assert!(e.resample_track_to_pad(0, 8).is_err());
+    }
+
+    #[test]
+    fn resample_prints_tape_bus_into_pad() {
+        // Warmth: an alternating signal settles to a saturated level
+        // well below the dry 1024/-1023 (a constant would be pure DC,
+        // which the warmth stage's DC blocker correctly removes).
+        let mut e = Engine::new();
+        e.four_track.tracks[0].samples =
+            (0..1000).map(|i| if i % 2 == 0 { 0.5 } else { -0.5 }).collect();
+        e.four_track.set_warmth(100.0);
+        e.resample_track_to_pad(0, 0).unwrap();
+        let warm = e.pads[0].sample.clone();
+        assert_eq!(warm[900], warm[902], "settled by the tail");
+        assert!(warm[900] < 1024 && warm[900] > 0, "saturated: {}", warm[900]);
+        assert!(warm[901] < 0 && warm[901] > -1023, "saturated: {}", warm[901]);
+        // Distortion: constant in, constant (squashed) out.
+        let mut e = Engine::new();
+        e.four_track.tracks[0].samples = vec![0.5; 100];
+        e.four_track.set_distortion(100.0);
+        e.resample_track_to_pad(0, 0).unwrap();
+        let dist = e.pads[0].sample.clone();
+        assert!(dist.iter().all(|&s| s == dist[0]), "stateless");
+        assert!(dist[0] < 512 && dist[0] > 0, "squashed: {}", dist[0]);
+        // Same bounce twice is identical (fresh bus state each time).
+        let mut e = Engine::new();
+        e.four_track.tracks[0].samples = vec![0.5, -0.5, 0.25, -0.25];
+        e.four_track.set_warmth(75.0);
+        e.four_track.set_distortion(40.0);
+        e.resample_track_to_pad(0, 0).unwrap();
+        e.resample_track_to_pad(0, 1).unwrap();
+        assert_eq!(e.pads[0].sample, e.pads[1].sample);
     }
 
     #[test]

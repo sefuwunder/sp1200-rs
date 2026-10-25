@@ -225,6 +225,22 @@ impl FourTrack {
         y
     }
 
+    /// Offline render of `samples` through the tape bus, for bouncing
+    /// a track to a pad: the pad gets what the tape section sounds
+    /// like, not the dry take. Runs with a FRESH filter state so
+    /// bounces are repeatable regardless of playback history, and
+    /// restores the live bus state untouched afterwards. At 0/0 this
+    /// returns the input unchanged.
+    pub fn print_bus(&mut self, samples: &[f32]) -> Vec<f32> {
+        let saved = (self.warm_dc_in, self.warm_dc_out, self.warm_lp);
+        self.warm_dc_in = 0.0;
+        self.warm_dc_out = 0.0;
+        self.warm_lp = 0.0;
+        let out: Vec<f32> = samples.iter().map(|&s| self.tape_bus(s)).collect();
+        (self.warm_dc_in, self.warm_dc_out, self.warm_lp) = saved;
+        out
+    }
+
     /// Asymmetric saturator: the x^2 term adds even harmonics (tube
     /// character), the tanh bounds it, and dividing by drive keeps
     /// small-signal gain at 1. Followed by a DC blocker (the asymmetry
@@ -718,6 +734,26 @@ mod tests {
         assert_eq!(ft.tracks[0].trim_start, 0);
         assert_eq!(ft.tracks[0].trim_end, None);
         assert!(ft.tracks[0].samples.is_empty());
+    }
+
+    #[test]
+    fn print_bus_restores_live_state() {
+        let mut ft = FourTrack::new();
+        // Fresh-state render at 0/0 is the input unchanged.
+        assert_eq!(ft.print_bus(&[0.5, -0.5, 0.0]), vec![0.5, -0.5, 0.0]);
+        // Live filter state survives a bounce untouched.
+        ft.warm_dc_in = 0.3;
+        ft.warm_dc_out = 0.2;
+        ft.warm_lp = 0.1;
+        ft.set_warmth(100.0);
+        let out = ft.print_bus(&[0.5; 20]);
+        assert_eq!(out.len(), 20);
+        assert_eq!(ft.warm_dc_in, 0.3);
+        assert_eq!(ft.warm_dc_out, 0.2);
+        assert_eq!(ft.warm_lp, 0.1);
+        // And bounces are repeatable: same input, same output.
+        let again = ft.print_bus(&[0.5; 20]);
+        assert_eq!(out, again);
     }
 
     #[test]
