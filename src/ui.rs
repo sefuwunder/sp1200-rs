@@ -306,8 +306,13 @@ pub fn handle_event(ui: &mut Ui, eng: &mut Engine, ev: &Event) -> bool {
                 }
                 return false;
             }
-            // ':' opens the command line on any page.
-            if *k == Keycode::Colon {
+            // ':' opens the command line on any page. SDL reports
+            // Shift+; as Colon on most layouts, but some drivers and
+            // keymaps report Semicolon with shift instead — accept both,
+            // so the key opens the prompt whatever SDL delivers. (Plain
+            // ';' keeps its page bindings; only the shifted form opens.)
+            let shifted = keymod.intersects(Mod::LSHIFTMOD | Mod::RSHIFTMOD);
+            if *k == Keycode::Colon || (*k == Keycode::Semicolon && shifted) {
                 ui.cmdline = Some(String::new());
                 return false;
             }
@@ -1955,6 +1960,41 @@ mod tests {
             &mut eng,
             &key(Keycode::Return, nomod)
         ));
+    }
+
+    #[test]
+    fn colon_opens_via_shift_semicolon_on_every_page() {
+        let mut eng = Engine::new();
+        let mut ui = Ui::new();
+        let key = |kc, m| Event::KeyDown {
+            timestamp: 0,
+            window_id: 0,
+            keycode: Some(kc),
+            scancode: None,
+            keymod: m,
+            repeat: false,
+        };
+        let nomod = sdl2::keyboard::Mod::NOMOD;
+        let shift = sdl2::keyboard::Mod::LSHIFTMOD;
+        // Some SDL drivers report ':' as Semicolon+shift, not Colon:
+        // that must open the prompt on every page.
+        for page in [Page::Pads, Page::Edit, Page::Tape] {
+            ui.page = page;
+            handle_event(&mut ui, &mut eng, &key(Keycode::Semicolon, shift));
+            assert_eq!(ui.cmdline.as_deref(), Some(""), "no prompt on {page:?}");
+            handle_event(&mut ui, &mut eng, &key(Keycode::Escape, nomod));
+            assert_eq!(ui.cmdline, None);
+        }
+        // Plain ';' must not open the prompt anywhere.
+        ui.page = Page::Pads;
+        handle_event(&mut ui, &mut eng, &key(Keycode::Semicolon, nomod));
+        assert_eq!(ui.cmdline, None);
+        // ...and it keeps its Tape-page trim binding.
+        ui.page = Page::Tape;
+        eng.four_track.tracks[0].samples = vec![0.5; 26040];
+        handle_event(&mut ui, &mut eng, &key(Keycode::Semicolon, nomod));
+        assert_eq!(eng.four_track.tracks[0].trim_end, Some(23436));
+        assert_eq!(ui.cmdline, None);
     }
 
     #[test]
