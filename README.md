@@ -53,6 +53,7 @@ time).
 | `P` | Panic — kill all sounding voices immediately |
 | `K` | Lock/unlock the selected pad: locked pads keep their sample while tapes are loaded, spliced, or cleared (a small square marks them) |
 | `Esc` / `Q` | Quit |
+| `:` | Vim-style command prompt (`:help` lists commands; `Esc` cancels) |
 
 ## Sample editor (`Tab`)
 
@@ -72,6 +73,11 @@ or loaded WAV). Edits are non-destructive except normalize.
 | `-` / `=` | Filter resonance (Q), 0.1 – 12 |
 | `M` | Mono/poly per pad: mono retriggering cuts the pad's own ringing voices |
 | `[` / `]` | Pad pitch −/+ 1 semitone (±24 st) |
+| `L` | Toggle pad looping: the voice plays the sample once, then repeats the loop region forever |
+| `Shift+Z` / `Shift+X` | Loop start −/+ (same gesture as trim, shifted) |
+| `Shift+C` / `Shift+V` | Loop end −/+ |
+
+Loop points are fractions of the pad's playable sample (so they survive trim/reverse edits), set exactly with `:loop START_S END_S`, and saved into native projects.
 
 ### 4-track tape
 
@@ -79,13 +85,43 @@ or loaded WAV). Edits are non-destructive except normalize.
 (the default audio capture device — mic/line-in) or bouncing the pattern
 mix. Each track has `A` arm, `I` input/master source, `M` mute, `X` clear;
 `1-4` selects the track. `ENTER` plays/stops the tape, `R` toggles
-recording on armed tracks (starting playback), `S` stops and rewinds.
+recording on armed tracks (starting playback), `U` is the universal
+record/stop button: it arms all four tracks and records, and stopping
+keeps every take and safes all four, so a stray `R` can't punch over
+them afterwards. `S` stops and rewinds.
 `SPACE` still runs the pattern sequencer, so bouncing is: arm a track with
 `MASTER` source, hit `R`, hit `SPACE`, hit `R` again. Recording is
 punch-in style — the armed region is replaced, and armed tracks aren't
 played back while recording (no feedback). The header shows `IN OK` /
 `IN NONE` for the capture device. Track audio and settings are saved into
 native projects.
+
+Trim is a non-destructive playback window per track: `,` / `.` nudge the
+selected track's trim start, `;` / `'` its trim end, in 0.1 s steps — a
+trimmed track stays silent outside its window, and trimming never deletes
+audio. `B` resamples the selected track's trimmed region onto the
+same-number pad through the 12-bit path (track 1 → pad 1); the pad keeps
+the resample as its custom sound, so `W` saves it and tape-clear restores
+it.
+
+### Command prompt (`:`)
+
+`:` opens a vim-style command line on any page: type the command,
+`Enter` runs it, `Esc` cancels (never quits), `Backspace` edits.
+
+| Command | Action |
+|---|---|
+| `:help` | List commands (one line; this file has the details) |
+| `:w` / `:q` | Save the project / quit |
+| `:bpm N` / `:swing N` | Set BPM (60–200) / swing (50–75%) |
+| `:pad N` / `:track N` | Select pad (1–8) / 4-track track (1–4) |
+| `:loop` | Toggle looping on the selected pad |
+| `:loop on` / `:loop off` | Enable / disable looping |
+| `:loop START_S END_S` | Set loop points in seconds and enable looping |
+| `:ttrim START_S END_S` / `:ttrim full` | Set / clear the selected track's trim window |
+| `:resample [TRACK] [PAD]` | Resample a track's trimmed region onto a pad (defaults: selected track → same-number pad) |
+| `:rec` / `:rec all` | Record armed tracks / record all four tracks |
+| `:stop` / `:rewind` / `:play` | Stop (keep playhead) / stop + rewind / play-stop the tape |
 
 `sp1200-rs --pad 3 kick.wav` loads a WAV onto pad 3 at startup. Choke
 groups, filters (cutoff + resonance), mono/poly, pitch, trim, reverse, and user samples are saved into native

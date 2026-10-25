@@ -281,9 +281,11 @@ fn print_help() {
     println!("      K lock pad, S/E splice, D clear tape, W save project, 1-8 pads,");
     println!("      F1-F3 presets, arrows/comma/period adjust, ESC quit.");
     println!("      editor: Z/X C/V trim, R reverse, N normalize, B browse, G choke, F filter,");
-    println!("      M mono/poly, K lock, up/down cutoff, -/= resonance, [/] pitch.");
+    println!("      M mono/poly, K lock, up/down cutoff, -/= resonance, [/] pitch, L loop,");
+    println!("      SHIFT+Z/X/C/V loop points.");
     println!("      4-track: 1-4 select, A arm, I input/master, M mute, X clear,");
-    println!("      ENTER play/stop, R record, S rewind.");
+    println!("      ENTER play/stop, R record, U record all, S rewind, ,/. ;/' trim, B to pad.");
+    println!("      : opens the command prompt (:help lists commands, ESC cancels).");
     println!("      drop a .wav/.mp3 or .json file onto the window to load it.");
 }
 

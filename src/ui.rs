@@ -6,6 +6,7 @@
 
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
+use sdl2::keyboard::Mod;
 use sdl2::mouse::MouseButton;
 use sdl2::pixels::Color;
 use sdl2::rect::Rect;
@@ -14,6 +15,7 @@ use sdl2::surface::Surface;
 use sdl2::video::Window;
 use std::time::Instant;
 
+use crate::dsp::SP_RATE;
 use crate::engine::{Engine, N_CHOKE_GROUPS, N_PADS, N_STEPS};
 use crate::fourtrack::{TrackSource, N_TRACKS};
 
@@ -211,6 +213,8 @@ pub struct Ui {
     pub browser: Option<Browser>,
     /// Directory scanned by the browser (--samples-dir, default ./samples).
     pub samples_dir: String,
+    /// Vim-style command line: Some(buf) while ':' editing is open.
+    pub cmdline: Option<String>,
 }
 
 impl Ui {
@@ -224,6 +228,7 @@ impl Ui {
             page: Page::Pads,
             browser: None,
             samples_dir: "./samples".to_string(),
+            cmdline: None,
         }
     }
 
@@ -245,7 +250,9 @@ pub fn handle_event(ui: &mut Ui, eng: &mut Engine, ev: &Event) -> bool {
     match ev {
         Event::Quit { .. } => return true,
         Event::KeyDown {
-            keycode: Some(k), ..
+            keycode: Some(k),
+            keymod,
+            ..
         } => {
             // Sample browser overlay eats its own keys.
             if ui.browser.is_some() {
@@ -258,29 +265,88 @@ pub fn handle_event(ui: &mut Ui, eng: &mut Engine, ev: &Event) -> bool {
                 }
                 return false;
             }
+            // Vim-style command line eats every key while open: typing
+            // fills it, Return runs it, Esc cancels (never quits).
+            if ui.cmdline.is_some() {
+                match *k {
+                    Keycode::Return | Keycode::KpEnter => {
+                        let input = ui.cmdline.take().unwrap();
+                        return run_command(ui, eng, &input);
+                    }
+                    Keycode::Escape => {
+                        ui.cmdline = None;
+                    }
+                    Keycode::Backspace => {
+                        if let Some(buf) = &mut ui.cmdline {
+                            buf.pop();
+                        }
+                    }
+                    _ => {
+                        if let Some(c) = cmd_char(*k) {
+                            if let Some(buf) = &mut ui.cmdline {
+                                if buf.len() < 80 {
+                                    buf.push(c);
+                                }
+                            }
+                        }
+                    }
+                }
+                return false;
+            }
+            // ':' opens the command line on any page.
+            if *k == Keycode::Colon {
+                ui.cmdline = Some(String::new());
+                return false;
+            }
             // Sample editor page keys (Tab/Up/Down handled here, the rest
             // falls through to the global keys below).
             if ui.page == Page::Edit {
                 let i = ui.selected_pad;
+                let shifted = keymod.intersects(Mod::LSHIFTMOD | Mod::RSHIFTMOD);
                 let handled = match *k {
                     Keycode::Tab => {
                         ui.page = Page::Pads;
                         true
                     }
                     Keycode::Z => {
-                        eng.nudge_trim(i, 0, -0.01);
+                        if shifted {
+                            eng.nudge_loop(i, 0, -0.01);
+                        } else {
+                            eng.nudge_trim(i, 0, -0.01);
+                        }
                         true
                     }
                     Keycode::X => {
-                        eng.nudge_trim(i, 0, 0.01);
+                        if shifted {
+                            eng.nudge_loop(i, 0, 0.01);
+                        } else {
+                            eng.nudge_trim(i, 0, 0.01);
+                        }
                         true
                     }
                     Keycode::C => {
-                        eng.nudge_trim(i, 1, -0.01);
+                        if shifted {
+                            eng.nudge_loop(i, 1, -0.01);
+                        } else {
+                            eng.nudge_trim(i, 1, -0.01);
+                        }
                         true
                     }
                     Keycode::V => {
-                        eng.nudge_trim(i, 1, 0.01);
+                        if shifted {
+                            eng.nudge_loop(i, 1, 0.01);
+                        } else {
+                            eng.nudge_trim(i, 1, 0.01);
+                        }
+                        true
+                    }
+                    Keycode::L => {
+                        let on = eng.toggle_loop(i);
+                        ui.say(format!(
+                            "PAD {} LOOP {}",
+                            i + 1,
+                            if on { "ON" } else { "OFF" }
+                        ));
                         true
                     }
                     Keycode::R => {
@@ -349,8 +415,30 @@ pub fn handle_event(ui: &mut Ui, eng: &mut Engine, ev: &Event) -> bool {
             }
             // 4-track tape page keys (Tab/Esc handled here too).
             if ui.page == Page::Tape {
-                let has_input = eng.has_input();
+                // R / U / B need the whole engine (pads + four-track),
+                // so they run before the four-track borrow below.
+                match *k {
+                    Keycode::R => {
+                        tape_record(ui, eng, false);
+                        return false;
+                    }
+                    Keycode::U => {
+                        tape_record(ui, eng, true);
+                        return false;
+                    }
+                    Keycode::B => {
+                        let t = eng.four_track.selected;
+                        match eng.resample_track_to_pad(t, t) {
+                            Ok(m) => ui.say(m),
+                            Err(e) => ui.say_err(e),
+                        }
+                        return false;
+                    }
+                    _ => {}
+                }
                 let ft = &mut eng.four_track;
+                // Trim step: 0.1 s of tape.
+                let step = (SP_RATE as f32 * 0.1) as isize;
                 let handled = match *k {
                     Keycode::Tab | Keycode::Escape => {
                         ui.page = Page::Pads;
@@ -397,22 +485,32 @@ pub fn handle_event(ui: &mut Ui, eng: &mut Engine, ev: &Event) -> bool {
                         ui.say(m);
                         true
                     }
-                    Keycode::R => {
-                        match ft.toggle_record() {
-                            Ok(m) => {
-                                if !has_input
-                                    && ft
-                                        .tracks
-                                        .iter()
-                                        .any(|t| t.armed && t.source == TrackSource::Input)
-                                {
-                                    ui.say(format!("{m} (NO INPUT DEVICE)"));
-                                } else {
-                                    ui.say(m);
-                                }
-                            }
-                            Err(e) => ui.say_err(e),
-                        }
+                    Keycode::Comma => {
+                        let n = ft.selected + 1;
+                        ft.tracks[ft.selected].nudge_trim_start(-step);
+                        let l = ft.tracks[ft.selected].trim_label();
+                        ui.say(format!("TRACK {n} TRIM {l}"));
+                        true
+                    }
+                    Keycode::Period => {
+                        let n = ft.selected + 1;
+                        ft.tracks[ft.selected].nudge_trim_start(step);
+                        let l = ft.tracks[ft.selected].trim_label();
+                        ui.say(format!("TRACK {n} TRIM {l}"));
+                        true
+                    }
+                    Keycode::Semicolon => {
+                        let n = ft.selected + 1;
+                        ft.tracks[ft.selected].nudge_trim_end(-step);
+                        let l = ft.tracks[ft.selected].trim_label();
+                        ui.say(format!("TRACK {n} TRIM {l}"));
+                        true
+                    }
+                    Keycode::Quote => {
+                        let n = ft.selected + 1;
+                        ft.tracks[ft.selected].nudge_trim_end(step);
+                        let l = ft.tracks[ft.selected].trim_label();
+                        ui.say(format!("TRACK {n} TRIM {l}"));
                         true
                     }
                     Keycode::S => {
@@ -540,22 +638,7 @@ pub fn handle_event(ui: &mut Ui, eng: &mut Engine, ev: &Event) -> bool {
                     ));
                 }
                 Keycode::W => {
-                    let path = ui
-                        .project_path
-                        .clone()
-                        .unwrap_or_else(|| "./sp1200-project.json".to_string());
-                    let stem = path
-                        .rsplit(['/', '\\'])
-                        .next()
-                        .unwrap_or("sp1200-project.json");
-                    let name = stem.rsplit_once('.').map(|(s, _)| s).unwrap_or(stem);
-                    match crate::project::save_native_file(eng, &path, name) {
-                        Ok(()) => {
-                            ui.project_path = Some(path.clone());
-                            ui.say(format!("SAVED {path}"));
-                        }
-                        Err(e) => ui.say_err(e),
-                    }
+                    save_project(ui, eng);
                 }
                 _ => {}
             }
@@ -641,6 +724,257 @@ fn browser_load(ui: &mut Ui, eng: &mut Engine) {
     }
 }
 
+fn save_project(ui: &mut Ui, eng: &mut Engine) {
+    let path = ui
+        .project_path
+        .clone()
+        .unwrap_or_else(|| "./sp1200-project.json".to_string());
+    let stem = path
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("sp1200-project.json");
+    let name = stem.rsplit_once('.').map(|(s, _)| s).unwrap_or(stem);
+    match crate::project::save_native_file(eng, &path, name) {
+        Ok(()) => {
+            ui.project_path = Some(path.clone());
+            ui.say(format!("SAVED {path}"));
+        }
+        Err(e) => ui.say_err(e),
+    }
+}
+
+/// Tape record, normal (`R`: armed tracks only) or universal (`U`:
+/// every track). Appends the no-input-device warning when an INPUT
+/// track is armed but no capture device exists.
+fn tape_record(ui: &mut Ui, eng: &mut Engine, all: bool) {
+    let m = if all {
+        eng.four_track.toggle_record_all()
+    } else {
+        match eng.four_track.toggle_record() {
+            Ok(m) => m,
+            Err(e) => {
+                ui.say_err(e);
+                return;
+            }
+        }
+    };
+    if !eng.has_input()
+        && eng
+            .four_track
+            .tracks
+            .iter()
+            .any(|t| t.armed && t.source == TrackSource::Input)
+    {
+        ui.say(format!("{m} (NO INPUT DEVICE)"));
+    } else {
+        ui.say(m);
+    }
+}
+
+/// Map a key press to a command-line character. Letters come through
+/// lowercased (commands are case-insensitive); only the punctuation
+/// commands use is accepted, so shifted symbols can't sneak in.
+fn cmd_char(k: Keycode) -> Option<char> {
+    Some(match k {
+        Keycode::A => 'a',
+        Keycode::B => 'b',
+        Keycode::C => 'c',
+        Keycode::D => 'd',
+        Keycode::E => 'e',
+        Keycode::F => 'f',
+        Keycode::G => 'g',
+        Keycode::H => 'h',
+        Keycode::I => 'i',
+        Keycode::J => 'j',
+        Keycode::K => 'k',
+        Keycode::L => 'l',
+        Keycode::M => 'm',
+        Keycode::N => 'n',
+        Keycode::O => 'o',
+        Keycode::P => 'p',
+        Keycode::Q => 'q',
+        Keycode::R => 'r',
+        Keycode::S => 's',
+        Keycode::T => 't',
+        Keycode::U => 'u',
+        Keycode::V => 'v',
+        Keycode::W => 'w',
+        Keycode::X => 'x',
+        Keycode::Y => 'y',
+        Keycode::Z => 'z',
+        Keycode::Num0 => '0',
+        Keycode::Num1 => '1',
+        Keycode::Num2 => '2',
+        Keycode::Num3 => '3',
+        Keycode::Num4 => '4',
+        Keycode::Num5 => '5',
+        Keycode::Num6 => '6',
+        Keycode::Num7 => '7',
+        Keycode::Num8 => '8',
+        Keycode::Num9 => '9',
+        Keycode::Space => ' ',
+        Keycode::Minus => '-',
+        Keycode::Period => '.',
+        _ => return None,
+    })
+}
+
+/// Next whitespace-separated command argument, or "" when absent.
+fn next_arg<'a>(parts: &mut std::str::SplitWhitespace<'a>) -> &'a str {
+    parts.next().unwrap_or("")
+}
+
+/// Run one `:command` line. Returns true when the app should quit.
+/// Times are seconds; pad/track numbers are 1-based, like the UI.
+fn run_command(ui: &mut Ui, eng: &mut Engine, input: &str) -> bool {
+    let mut parts = input.split_whitespace();
+    let cmd = match parts.next() {
+        Some(c) => c.to_ascii_lowercase(),
+        None => return false,
+    };
+    let num = |s: &str| s.parse::<f64>().ok();
+    match cmd.as_str() {
+        "help" => ui.say("W SAVE Q QUIT BPM SWING PAD TRACK LOOP TTRIM RESAMPLE REC STOP PLAY - SEE README"),
+        "w" => save_project(ui, eng),
+        "q" => return true,
+        "bpm" => match num(next_arg(&mut parts)) {
+            Some(n) => {
+                eng.bpm = n.clamp(60.0, 200.0);
+                ui.say(format!("BPM {:03.0}", eng.bpm));
+            }
+            None => ui.say_err("USAGE: :BPM 120"),
+        },
+        "swing" => match num(next_arg(&mut parts)) {
+            Some(n) => {
+                eng.swing = n.clamp(50.0, 75.0);
+                ui.say(format!("SWING {:02.0}%", eng.swing));
+            }
+            None => ui.say_err("USAGE: :SWING 62"),
+        },
+        "pad" => match next_arg(&mut parts).parse::<usize>() {
+            Ok(n) if (1..=8).contains(&n) => {
+                ui.selected_pad = n - 1;
+                ui.say(format!("PAD {n}"));
+            }
+            _ => ui.say_err("USAGE: :PAD 1-8"),
+        },
+        "track" => match next_arg(&mut parts).parse::<usize>() {
+            Ok(n) if (1..=4).contains(&n) => {
+                eng.four_track.select(n - 1);
+                ui.say(format!("TRACK {n}"));
+            }
+            _ => ui.say_err("USAGE: :TRACK 1-4"),
+        },
+        "loop" => {
+            let i = ui.selected_pad;
+            match next_arg(&mut parts) {
+                "" => {
+                    let on = eng.toggle_loop(i);
+                    ui.say(format!(
+                        "PAD {} LOOP {}",
+                        i + 1,
+                        if on { "ON" } else { "OFF" }
+                    ));
+                }
+                "on" => {
+                    eng.pads[i].loop_enabled = true;
+                    ui.say(format!("PAD {} LOOP ON", i + 1));
+                }
+                "off" => {
+                    eng.pads[i].loop_enabled = false;
+                    ui.say(format!("PAD {} LOOP OFF", i + 1));
+                }
+                s => match (num(s), num(next_arg(&mut parts))) {
+                    (Some(a), Some(b)) => match eng.set_loop_secs(i, a as f32, b as f32) {
+                        Ok(m) => ui.say(m),
+                        Err(e) => ui.say_err(e),
+                    },
+                    _ => ui.say_err("USAGE: :LOOP ON/OFF OR :LOOP START_S END_S"),
+                },
+            }
+        }
+        "ttrim" => match next_arg(&mut parts) {
+            "full" => {
+                let t = eng.four_track.selected;
+                eng.four_track.tracks[t].reset_trim();
+                ui.say(format!("TRACK {} TRIM FULL", t + 1));
+            }
+            s => match (num(s), num(next_arg(&mut parts))) {
+                (Some(a), Some(b)) => {
+                    let t = eng.four_track.selected;
+                    let tr = &mut eng.four_track.tracks[t];
+                    if tr.samples.is_empty() {
+                        ui.say_err("TRACK EMPTY");
+                    } else {
+                        let n = tr.samples.len();
+                        let sa = ((a * SP_RATE as f64) as usize).min(n);
+                        let eb = ((b * SP_RATE as f64) as usize).min(n);
+                        if eb <= sa {
+                            ui.say_err("USAGE: :TTRIM NEEDS START < END");
+                        } else {
+                            tr.set_trim(sa, Some(eb));
+                            let l = tr.trim_label();
+                            ui.say(format!("TRACK {} TRIM {l}", t + 1));
+                        }
+                    }
+                }
+                _ => ui.say_err("USAGE: :TTRIM START_S END_S OR :TTRIM FULL"),
+            },
+        },
+        "resample" => {
+            let sel = eng.four_track.selected;
+            let a1 = next_arg(&mut parts);
+            let a2 = next_arg(&mut parts);
+            let parsed = if a1.is_empty() {
+                Some((sel, sel))
+            } else if a2.is_empty() {
+                a1.parse::<usize>().ok().and_then(|n| {
+                    if (1..=8).contains(&n) {
+                        Some((sel, n - 1))
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                match (a1.parse::<usize>(), a2.parse::<usize>()) {
+                    (Ok(t), Ok(p)) if (1..=4).contains(&t) && (1..=8).contains(&p) => {
+                        Some((t - 1, p - 1))
+                    }
+                    _ => None,
+                }
+            };
+            match parsed {
+                Some((t, p)) => match eng.resample_track_to_pad(t, p) {
+                    Ok(m) => ui.say(m),
+                    Err(e) => ui.say_err(e),
+                },
+                None => ui.say_err("USAGE: :RESAMPLE [TRACK] [PAD]"),
+            }
+        }
+        "rec" => match next_arg(&mut parts) {
+            "all" => tape_record(ui, eng, true),
+            "" => tape_record(ui, eng, false),
+            _ => ui.say_err("USAGE: :REC OR :REC ALL"),
+        },
+        "stop" => {
+            let ft = &mut eng.four_track;
+            ft.playing = false;
+            ft.recording = false;
+            ui.say("TAPE STOP");
+        }
+        "rewind" => {
+            let m = eng.four_track.stop_rewind();
+            ui.say(m);
+        }
+        "play" => {
+            let m = eng.four_track.toggle_play();
+            ui.say(m);
+        }
+        _ => ui.say_err("UNKNOWN COMMAND - :HELP"),
+    }
+    false
+}
+
 fn drop_path(ui: &mut Ui, eng: &mut Engine, path: &str) {
     let lower = path.to_lowercase();
     if lower.ends_with(".wav") || lower.ends_with(".mp3") {
@@ -724,6 +1058,9 @@ pub fn draw(p: &mut dyn Painter, ui: &Ui, eng: &Engine) {
         if eng.pads[i].mono {
             sub.push_str("M ");
         }
+        if eng.pads[i].loop_enabled {
+            sub.push_str("LOOP ");
+        }
         if eng.pads[i].choke != 0 {
             sub.push_str(&format!("G{} ", eng.pads[i].choke));
         }
@@ -789,7 +1126,7 @@ pub fn draw(p: &mut dyn Painter, ui: &Ui, eng: &Engine) {
     p.text(
         24,
         584,
-        "SPACE PLAY/STOP  T TAP  TAB EDIT  A 4-TRACK  P PANIC  K LOCK  S/E SPLICE  D TAPE OFF  W SAVE  ESC QUIT",
+        "SPACE PLAY/STOP  T TAP  TAB EDIT  A 4-TRACK  P PANIC  K LOCK  S/E SPLICE  D TAPE OFF  W SAVE  : CMDS  ESC QUIT",
         1,
         DIM,
     );
@@ -803,7 +1140,6 @@ pub fn draw(p: &mut dyn Painter, ui: &Ui, eng: &Engine) {
 }
 
 fn draw_tape(p: &mut dyn Painter, ui: &Ui, eng: &Engine) {
-    use crate::dsp::SP_RATE;
     p.rect(0, 0, W, H, BG);
     p.rect(0, 0, W, 76, PLATE);
     p.text(24, 22, "SP-1200 RS", 3, TEXT);
@@ -868,6 +1204,8 @@ fn draw_tape(p: &mut dyn Painter, ui: &Ui, eng: &Engine) {
         );
         sy += 22;
         p.text(44, sy, &format!("{:.1}S", tr.len_secs()), 1, DIM);
+        sy += 22;
+        p.text(44, sy, &format!("TRIM {}", tr.trim_label()), 1, DIM);
 
         // Waveform overview.
         let (wx, wy, ww, wh) = (300i32, y0, 700u32, 88u32);
@@ -910,14 +1248,14 @@ fn draw_tape(p: &mut dyn Painter, ui: &Ui, eng: &Engine) {
     p.text(
         24,
         580,
-        "1-4 SELECT  A ARM  I INPUT/MASTER  M MUTE  X CLEAR TRACK",
+        "1-4 SELECT  A ARM  I INPUT/MASTER  M MUTE  X CLEAR TRACK  U REC ALL",
         1,
         DIM,
     );
     p.text(
         24,
         602,
-        "ENTER PLAY/STOP  R RECORD  S REWIND  L LOOP  SPACE PATTERN  TAB PADS",
+        "ENTER PLAY/STOP  R RECORD  S REWIND  L LOOP  ,/. ;/' TRIM  B TO PAD  : CMDS  TAB PADS",
         1,
         DIM,
     );
@@ -925,6 +1263,14 @@ fn draw_tape(p: &mut dyn Painter, ui: &Ui, eng: &Engine) {
 }
 
 fn draw_msg(p: &mut dyn Painter, ui: &Ui) {
+    // The command line replaces the message row while it is open.
+    if let Some(buf) = &ui.cmdline {
+        let line = format!(":{buf}");
+        p.text(24, 550, &line, 1, SEL);
+        let cx = 24 + text_w(&line, 1) as i32;
+        p.rect(cx, 550, 6, 10, SEL);
+        return;
+    }
     if let Some((text, until, is_err)) = &ui.msg {
         if Instant::now() <= *until {
             p.text(24, 550, text, 1, if *is_err { PLAYHEAD } else { TEXT });
@@ -996,6 +1342,15 @@ fn draw_edit(p: &mut dyn Painter, ui: &Ui, eng: &Engine) {
             pad.trim.0 * 100.0,
             pad.trim.1 * 100.0
         ),
+        if pad.loop_enabled {
+            format!(
+                "LOOP ON {:02.0}% - {:02.0}%",
+                pad.loop_pts.0 * 100.0,
+                pad.loop_pts.1 * 100.0
+            )
+        } else {
+            "LOOP OFF".to_string()
+        },
         format!("REVERSE {}", if pad.reverse { "ON" } else { "OFF" }),
         format!(
             "CHOKE {}",
@@ -1050,7 +1405,7 @@ fn draw_edit(p: &mut dyn Painter, ui: &Ui, eng: &Engine) {
     p.text(
         24,
         584,
-        "TAB PADS  Z/X TRIM START  C/V TRIM END  R REVERSE  N NORMALIZE",
+        "TAB PADS  Z/X TRIM START  C/V TRIM END  R REVERSE  N NORMALIZE  L LOOP  SHIFT+TRIM LOOP PTS",
         1,
         DIM,
     );
@@ -1408,6 +1763,174 @@ mod tests {
         });
         eng.refresh_pad_samples();
         {
+            let p: &mut dyn Painter = &mut surf;
+            draw(p, &ui, &eng);
+        }
+    }
+
+    #[test]
+    fn colon_prompt_typing_escape_and_quit() {
+        let mut eng = Engine::new();
+        let mut ui = Ui::new();
+        let key = |kc, m| Event::KeyDown {
+            timestamp: 0,
+            window_id: 0,
+            keycode: Some(kc),
+            scancode: None,
+            keymod: m,
+            repeat: false,
+        };
+        let nomod = sdl2::keyboard::Mod::NOMOD;
+        // ':' opens; typing fills; Backspace pops; Esc cancels, not quits.
+        assert!(!handle_event(&mut ui, &mut eng, &key(Keycode::Colon, nomod)));
+        assert_eq!(ui.cmdline.as_deref(), Some(""));
+        assert!(!handle_event(&mut ui, &mut eng, &key(Keycode::Q, nomod)));
+        assert_eq!(ui.cmdline.as_deref(), Some("q"));
+        assert!(!handle_event(&mut ui, &mut eng, &key(Keycode::Backspace, nomod)));
+        assert_eq!(ui.cmdline.as_deref(), Some(""));
+        assert!(!handle_event(&mut ui, &mut eng, &key(Keycode::Q, nomod)));
+        assert!(!handle_event(&mut ui, &mut eng, &key(Keycode::Escape, nomod)));
+        assert_eq!(ui.cmdline, None);
+        // Reopen and Return on "q" quits.
+        handle_event(&mut ui, &mut eng, &key(Keycode::Colon, nomod));
+        handle_event(&mut ui, &mut eng, &key(Keycode::Q, nomod));
+        assert!(handle_event(
+            &mut ui,
+            &mut eng,
+            &key(Keycode::Return, nomod)
+        ));
+    }
+
+    #[test]
+    fn run_command_parses_everything() {
+        let mut eng = Engine::new();
+        let mut ui = Ui::new();
+        eng.pads[2].set_source(vec![0i16; 26040], None); // pad 3: 1.0 s
+        eng.four_track.tracks[0].samples = vec![0.5; 26040];
+        eng.four_track.tracks[1].samples = vec![-0.25; 26040];
+
+        assert!(!run_command(&mut ui, &mut eng, "bpm 140"));
+        assert_eq!(eng.bpm, 140.0);
+        assert!(!run_command(&mut ui, &mut eng, "bpm 999")); // clamped
+        assert_eq!(eng.bpm, 200.0);
+        assert!(!run_command(&mut ui, &mut eng, "swing 55"));
+        assert_eq!(eng.swing, 55.0);
+        assert!(!run_command(&mut ui, &mut eng, "pad 3"));
+        assert_eq!(ui.selected_pad, 2);
+        assert!(!run_command(&mut ui, &mut eng, "track 2"));
+        assert_eq!(eng.four_track.selected, 1);
+        assert!(!run_command(&mut ui, &mut eng, "loop 0.25 0.75"));
+        assert!(eng.pads[2].loop_enabled);
+        assert!((eng.pads[2].loop_pts.0 - 0.25).abs() < 1e-6);
+        assert!(!run_command(&mut ui, &mut eng, "loop off"));
+        assert!(!eng.pads[2].loop_enabled);
+        assert!(!run_command(&mut ui, &mut eng, "loop"));
+        assert!(eng.pads[2].loop_enabled);
+        // Selected track is 2 (set above); ttrim applies to it.
+        assert!(!run_command(&mut ui, &mut eng, "ttrim 0.2 0.8"));
+        assert_eq!(eng.four_track.tracks[1].trim_start, 5208);
+        assert_eq!(eng.four_track.tracks[1].trim_end, Some(20832));
+        assert!(!run_command(&mut ui, &mut eng, "ttrim full"));
+        assert_eq!(eng.four_track.tracks[1].trim_end, None);
+        // Resample: track 1 -> pad 5, then default (selected track 2 -> pad 2).
+        assert!(!run_command(&mut ui, &mut eng, "resample 1 5"));
+        assert_eq!(eng.pads[4].sample.len(), 26040);
+        assert!(eng.pads[4].custom);
+        assert!(!run_command(&mut ui, &mut eng, "rec all"));
+        assert!(eng.four_track.recording);
+        assert!(eng.four_track.tracks.iter().all(|t| t.armed));
+        assert!(!run_command(&mut ui, &mut eng, "stop"));
+        assert!(!eng.four_track.recording);
+        assert!(!eng.four_track.playing);
+        assert!(!run_command(&mut ui, &mut eng, "play"));
+        assert!(eng.four_track.playing);
+        assert!(!run_command(&mut ui, &mut eng, "rewind"));
+        assert!(!eng.four_track.playing);
+        assert_eq!(eng.four_track.playhead, 0);
+        // Errors are clean messages, never panics; unknown -> :help hint.
+        assert!(!run_command(&mut ui, &mut eng, "bpm"));
+        assert!(ui.msg.as_ref().unwrap().2);
+        assert!(!run_command(&mut ui, &mut eng, "pad 9"));
+        assert!(ui.msg.as_ref().unwrap().2);
+        assert!(!run_command(&mut ui, &mut eng, "frobnicate"));
+        assert!(ui.msg.as_ref().unwrap().0.contains("HELP"));
+        assert!(!run_command(&mut ui, &mut eng, "help"));
+        assert!(!ui.msg.as_ref().unwrap().2);
+        assert!(!run_command(&mut ui, &mut eng, ""));
+        assert!(run_command(&mut ui, &mut eng, "q"));
+    }
+
+    #[test]
+    fn tape_u_record_all_and_b_resample_keys() {
+        let mut eng = Engine::new();
+        let mut ui = Ui::new();
+        ui.page = Page::Tape;
+        eng.four_track.tracks[0].samples = vec![0.5; 1000];
+        let key = |kc| Event::KeyDown {
+            timestamp: 0,
+            window_id: 0,
+            keycode: Some(kc),
+            scancode: None,
+            keymod: sdl2::keyboard::Mod::NOMOD,
+            repeat: false,
+        };
+        handle_event(&mut ui, &mut eng, &key(Keycode::U));
+        assert!(eng.four_track.recording);
+        assert!(eng.four_track.tracks.iter().all(|t| t.armed));
+        handle_event(&mut ui, &mut eng, &key(Keycode::U));
+        assert!(!eng.four_track.recording);
+        assert!(eng.four_track.tracks.iter().all(|t| !t.armed));
+        // B resamples the selected track (1) onto the same-number pad.
+        handle_event(&mut ui, &mut eng, &key(Keycode::B));
+        assert_eq!(eng.pads[0].sample, vec![1024i16; 1000]);
+        assert!(eng.pads[0].custom);
+        assert_eq!(eng.pads[0].label.as_deref(), Some("TRK1"));
+    }
+
+    #[test]
+    fn edit_loop_keys_and_tape_trim_keys() {
+        let mut eng = Engine::new();
+        let mut ui = Ui::new();
+        let key = |kc, m| Event::KeyDown {
+            timestamp: 0,
+            window_id: 0,
+            keycode: Some(kc),
+            scancode: None,
+            keymod: m,
+            repeat: false,
+        };
+        let nomod = sdl2::keyboard::Mod::NOMOD;
+        let shift = sdl2::keyboard::Mod::LSHIFTMOD;
+        // Editor: L toggles loop; Shift+Z/X nudge loop start, plain X
+        // nudges trim and leaves the loop alone.
+        ui.page = Page::Edit;
+        eng.pads[0].loop_pts = (0.5, 0.9);
+        handle_event(&mut ui, &mut eng, &key(Keycode::L, nomod));
+        assert!(eng.pads[0].loop_enabled);
+        handle_event(&mut ui, &mut eng, &key(Keycode::Z, shift));
+        assert!((eng.pads[0].loop_pts.0 - 0.49).abs() < 1e-6);
+        handle_event(&mut ui, &mut eng, &key(Keycode::X, shift));
+        assert!((eng.pads[0].loop_pts.0 - 0.5).abs() < 1e-6);
+        handle_event(&mut ui, &mut eng, &key(Keycode::X, nomod));
+        assert!((eng.pads[0].loop_pts.0 - 0.5).abs() < 1e-6);
+        assert!(eng.pads[0].trim.0 > 0.0);
+        // Tape: ,/. trim start, ;/' trim end, in 0.1 s steps.
+        ui.page = Page::Tape;
+        eng.four_track.tracks[0].samples = vec![0.5; 26040];
+        handle_event(&mut ui, &mut eng, &key(Keycode::Period, nomod));
+        assert_eq!(eng.four_track.tracks[0].trim_start, 2604);
+        handle_event(&mut ui, &mut eng, &key(Keycode::Comma, nomod));
+        assert_eq!(eng.four_track.tracks[0].trim_start, 0);
+        handle_event(&mut ui, &mut eng, &key(Keycode::Semicolon, nomod));
+        assert_eq!(eng.four_track.tracks[0].trim_end, Some(23436));
+        handle_event(&mut ui, &mut eng, &key(Keycode::Quote, nomod));
+        assert_eq!(eng.four_track.tracks[0].trim_end, Some(26040));
+        // Drawing all three pages with loop + trim + cmdline set: no panic.
+        eng.pads[0].loop_enabled = true;
+        ui.cmdline = Some("bpm 1".to_string());
+        let mut surf = Surface::new(W, H, PixelFormatEnum::RGB24).unwrap();
+        for page in [Page::Pads, Page::Edit, Page::Tape] {
+            ui.page = page;
             let p: &mut dyn Painter = &mut surf;
             draw(p, &ui, &eng);
         }

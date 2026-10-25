@@ -52,6 +52,11 @@ pub struct Pad {
     /// Non-destructive edit region, fractions of `source`.
     pub trim: (f32, f32),
     pub reverse: bool,
+    /// Loop region, fractions of the playable `sample` (not `source`, so
+    /// it survives trim/rebuild): a looping voice plays the sample from
+    /// the start, then repeats [loop_pts.0, loop_pts.1) forever.
+    pub loop_pts: (f32, f32),
+    pub loop_enabled: bool,
     /// Pinned: tape load/splice/clear won't replace this pad's sample.
     /// Explicit per-pad actions (browser load, edits) still apply.
     pub locked: bool,
@@ -76,6 +81,8 @@ impl Pad {
             choke: 0,
             trim: (0.0, 1.0),
             reverse: false,
+            loop_pts: (0.0, 1.0),
+            loop_enabled: false,
             locked: false,
         }
     }
@@ -127,6 +134,24 @@ impl Pad {
         );
         self.fb = fb;
         self.fa = fa;
+    }
+
+    /// Loop region in playable-sample indices, or None when looping is
+    /// off or the sample is too short. Always valid for interpolation:
+    /// loop_end <= len - 1, so idx + 1 never runs past the sample.
+    pub fn loop_range(&self) -> Option<(usize, usize)> {
+        if !self.loop_enabled {
+            return None;
+        }
+        let n = self.sample.len();
+        if n < 2 {
+            return None;
+        }
+        let a = (self.loop_pts.0.clamp(0.0, 1.0) * n as f32) as usize;
+        let a = a.min(n - 2);
+        let b = (self.loop_pts.1.clamp(0.0, 1.0) * n as f32) as usize;
+        let b = b.clamp(a + 1, n - 1);
+        Some((a, b))
     }
 }
 
@@ -576,6 +601,77 @@ impl Engine {
         p.rebuild();
     }
 
+    /// Toggle pad looping. Returns the new state.
+    pub fn toggle_loop(&mut self, i: usize) -> bool {
+        if i >= N_PADS {
+            return false;
+        }
+        self.pads[i].loop_enabled = !self.pads[i].loop_enabled;
+        self.pads[i].loop_enabled
+    }
+
+    /// Nudge a loop point by a fraction of the playable sample (which 0 =
+    /// start, 1 = end), keeping start < end with a 1% gap, like trim.
+    pub fn nudge_loop(&mut self, i: usize, which: usize, delta: f32) {
+        if i >= N_PADS {
+            return;
+        }
+        let p = &mut self.pads[i];
+        if which == 0 {
+            p.loop_pts.0 = (p.loop_pts.0 + delta).clamp(0.0, p.loop_pts.1 - 0.01);
+        } else {
+            p.loop_pts.1 = (p.loop_pts.1 + delta).clamp(p.loop_pts.0 + 0.01, 1.0);
+        }
+    }
+
+    /// Set loop points in seconds (of the playable sample) and enable
+    /// looping. Used by the `:loop` command.
+    pub fn set_loop_secs(&mut self, i: usize, start: f32, end: f32) -> Result<String, String> {
+        if i >= N_PADS {
+            return Err("NO SUCH PAD".to_string());
+        }
+        let dur = self.pads[i].sample.len() as f32 / SP_RATE as f32;
+        if dur <= 0.0 {
+            return Err("PAD HAS NO SAMPLE".to_string());
+        }
+        if !(start >= 0.0 && end > start && end <= dur) {
+            return Err(format!("LOOP NEEDS 0 <= START < END <= {dur:.2}S"));
+        }
+        self.pads[i].loop_pts = (start / dur, end / dur);
+        self.pads[i].loop_enabled = true;
+        Ok(format!("PAD {} LOOP {start:.2}-{end:.2}S", i + 1))
+    }
+
+    /// Resample a 4-track track's trimmed region onto a pad, through the
+    /// 12-bit path. The pad stops playing any tape chop and keeps the
+    /// resample as its custom sound (saved by `W`, restored on tape
+    /// clear). Returns a status line, or an error for bad indices /
+    /// empty regions.
+    pub fn resample_track_to_pad(&mut self, track: usize, pad: usize) -> Result<String, String> {
+        if track >= crate::fourtrack::N_TRACKS {
+            return Err("NO SUCH TRACK (1-4)".to_string());
+        }
+        if pad >= N_PADS {
+            return Err("NO SUCH PAD (1-8)".to_string());
+        }
+        let region = self.four_track.tracks[track].trimmed_region().to_vec();
+        if region.is_empty() {
+            return Err(format!("TRACK {} EMPTY (OR TRIM EMPTY)", track + 1));
+        }
+        let audio = dsp::quantize12_i16(&region);
+        let secs = audio.len() as f32 / SP_RATE as f32;
+        self.chop_map[pad] = None;
+        self.pad_factory[pad] = audio.clone();
+        self.pads[pad].custom = true;
+        self.pads[pad].set_source(audio, Some(format!("TRK{}", track + 1)));
+        Ok(format!(
+            "TRACK {} -> PAD {} ({:.1}S)",
+            track + 1,
+            pad + 1,
+            secs
+        ))
+    }
+
     /// Destructively normalize the pad's source to 0.92 peak, then rebuild.
     pub fn normalize_pad(&mut self, i: usize) {
         if i >= N_PADS || self.pads[i].source.is_empty() {
@@ -690,6 +786,16 @@ impl Engine {
                     continue;
                 }
                 let pad = &self.pads[v.pad];
+                // Looping: the voice plays from the start once, then
+                // repeats the loop region instead of dying at the end.
+                if let Some((la, lb)) = pad.loop_range() {
+                    let span = (lb - la) as f64;
+                    if span > 0.0 {
+                        while v.pos >= lb as f64 {
+                            v.pos -= span;
+                        }
+                    }
+                }
                 let idx = v.pos as usize;
                 if idx + 1 >= pad.sample.len() {
                     v.active = false;
@@ -1115,6 +1221,90 @@ mod tests {
         assert_eq!(after.len(), before.len());
         assert_eq!(after[0], before[before.len() - 1]);
         assert_eq!(after[after.len() - 1], before[0]);
+    }
+
+    #[test]
+    fn loop_range_clamps_to_valid_indices() {
+        let mut e = Engine::new();
+        // Loop off by default.
+        assert_eq!(e.pads[0].loop_range(), None);
+        e.pads[0].set_source((0..100).map(|i| i as i16).collect(), None);
+        e.pads[0].loop_enabled = true;
+        // Full loop: end clamps to len - 1 so idx + 1 stays in bounds.
+        assert_eq!(e.pads[0].loop_range(), Some((0, 99)));
+        // Fractions past the edges clamp, and a reversed pair still yields
+        // a valid (start < end) region.
+        e.pads[0].loop_pts = (0.9, 0.2);
+        assert_eq!(e.pads[0].loop_range(), Some((90, 91)));
+        // Too-short samples never loop.
+        e.pads[1].set_source(vec![7], None);
+        e.pads[1].loop_enabled = true;
+        assert_eq!(e.pads[1].loop_range(), None);
+    }
+
+    #[test]
+    fn looping_voice_survives_past_sample_end_and_repeats() {
+        let mut e = Engine::new();
+        // A tiny deterministic sample: ramp 0..99, so the loop period is
+        // visible sample-for-sample in the output.
+        let ramp: Vec<i16> = (0..100).map(|i| (i * 20) as i16).collect();
+        e.pads[0].set_source(ramp.clone(), None);
+        e.pads[0].loop_pts = (0.25, 0.75);
+        e.pads[0].loop_enabled = true;
+        // Pad 0 defaults: level 0.9, tune 0 st (ratio 1.0), master 0.8.
+        e.trigger(0);
+        let mut out = vec![0.0f32; 200];
+        e.render(&mut out);
+        assert_eq!(e.active_voices(), 1, "looping voice never dies");
+        let scale = 0.9 * 0.8 / 2047.0;
+        for i in 0..200 {
+            // Playhead: 0..74 once, then 25..74 repeating.
+            let pos = if i < 75 { i } else { 25 + (i - 75) % 50 };
+            let want = ramp[pos] as f32 * scale;
+            assert!((out[i] - want).abs() < 1e-4, "i={i} pos={pos}");
+        }
+        // Same pad, loop off: the voice dies at the end.
+        let mut e2 = Engine::new();
+        e2.pads[0].set_source(ramp, None);
+        e2.trigger(0);
+        let mut out2 = vec![0.0f32; 200];
+        e2.render(&mut out2);
+        assert_eq!(e2.active_voices(), 0, "non-looping voice dies");
+        assert!(out2[150..].iter().all(|&s| s == 0.0));
+    }
+
+    #[test]
+    fn loop_nudge_and_secs_command_validation() {
+        let mut e = Engine::new();
+        e.pads[0].set_source(vec![0i16; 26040], None); // exactly 1.0 s
+        e.nudge_loop(0, 0, 0.2);
+        assert!((e.pads[0].loop_pts.0 - 0.2).abs() < 1e-6);
+        e.nudge_loop(0, 1, -0.5);
+        assert!((e.pads[0].loop_pts.1 - 0.5).abs() < 1e-6);
+        e.nudge_loop(0, 0, 0.9); // start can never pass end
+        assert!(e.pads[0].loop_pts.0 <= e.pads[0].loop_pts.1);
+        assert!(e.set_loop_secs(0, 0.25, 0.75).is_ok());
+        assert!(e.pads[0].loop_enabled);
+        assert!(e.set_loop_secs(0, 0.75, 0.25).is_err()); // reversed
+        assert!(e.set_loop_secs(0, 0.0, 1.5).is_err()); // past the end
+        assert!(e.set_loop_secs(0, -0.1, 0.5).is_err()); // negative start
+    }
+
+    #[test]
+    fn resample_track_to_pad_quantizes_trimmed_region() {
+        let mut e = Engine::new();
+        e.four_track.tracks[2].samples = vec![0.0, 0.5, -0.5, 1.0, -1.0, 0.25];
+        e.four_track.tracks[2].set_trim(1, Some(5)); // 0.5, -0.5, 1.0, -1.0
+        let msg = e.resample_track_to_pad(2, 4).unwrap();
+        assert!(msg.contains("TRACK 3 -> PAD 5"), "{msg}");
+        let pad = &e.pads[4];
+        assert_eq!(pad.sample, vec![1024, -1023, 2047, -2047]);
+        assert!(pad.custom, "resample is saved by W");
+        assert_eq!(pad.label.as_deref(), Some("TRK3"));
+        // Empty region / bad indices are clean errors, no panic.
+        assert!(e.resample_track_to_pad(0, 0).is_err());
+        assert!(e.resample_track_to_pad(4, 0).is_err());
+        assert!(e.resample_track_to_pad(0, 8).is_err());
     }
 
     #[test]

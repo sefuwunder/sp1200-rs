@@ -58,6 +58,11 @@ pub struct Track {
     pub armed: bool,
     pub muted: bool,
     pub source: TrackSource,
+    /// Playback window in samples: only [trim_start, trim_end) sounds.
+    /// trim_end None = to the end of the track. Recording ignores the
+    /// window (it is a take, not playback); trimming never deletes audio.
+    pub trim_start: usize,
+    pub trim_end: Option<usize>,
 }
 
 impl Track {
@@ -67,11 +72,73 @@ impl Track {
             armed: false,
             muted: false,
             source: TrackSource::Master,
+            trim_start: 0,
+            trim_end: None,
         }
     }
 
     pub fn len_secs(&self) -> f32 {
         self.samples.len() as f32 / SP_RATE as f32
+    }
+
+    /// End of the playback window, clamped to the track.
+    pub fn trim_end_samples(&self) -> usize {
+        self.trim_end.unwrap_or(self.samples.len()).min(self.samples.len())
+    }
+
+    /// The audible region: [trim_start, trim_end), empty when the window
+    /// is degenerate or the track is empty.
+    pub fn trimmed_region(&self) -> &[f32] {
+        let a = self.trim_start.min(self.samples.len());
+        let b = self.trim_end_samples().max(a);
+        &self.samples[a..b]
+    }
+
+    /// True when a trim window is actually narrowing playback.
+    pub fn is_trimmed(&self) -> bool {
+        self.trim_start > 0
+            || self
+                .trim_end
+                .map(|e| e < self.samples.len())
+                .unwrap_or(false)
+    }
+
+    /// One-line trim readout for the UI: "FULL" or "1.2-4.5S".
+    pub fn trim_label(&self) -> String {
+        if !self.is_trimmed() {
+            return "FULL".to_string();
+        }
+        let a = self.trim_start as f32 / SP_RATE as f32;
+        let b = self.trim_end_samples() as f32 / SP_RATE as f32;
+        format!("{a:.1}-{b:.1}S")
+    }
+
+    /// Set the playback window in samples. Clamped to the track;
+    /// start >= end collapses to silence (never panics).
+    pub fn set_trim(&mut self, start: usize, end: Option<usize>) {
+        let n = self.samples.len();
+        self.trim_start = start.min(n);
+        self.trim_end = end.map(|e| e.min(n));
+    }
+
+    pub fn reset_trim(&mut self) {
+        self.trim_start = 0;
+        self.trim_end = None;
+    }
+
+    /// Nudge the window edges by `delta` samples (negative allowed),
+    /// keeping start <= end and both inside the track.
+    pub fn nudge_trim_start(&mut self, delta: isize) {
+        let end = self.trim_end_samples();
+        let v = self.trim_start as isize + delta;
+        self.trim_start = v.clamp(0, end as isize) as usize;
+    }
+
+    pub fn nudge_trim_end(&mut self, delta: isize) {
+        let start = self.trim_start;
+        let base = self.trim_end_samples() as isize + delta;
+        let v = base.clamp(start as isize, self.samples.len() as isize) as usize;
+        self.trim_end = Some(v);
     }
 }
 
@@ -138,6 +205,7 @@ impl FourTrack {
     pub fn clear_selected(&mut self) -> String {
         let t = &mut self.tracks[self.selected];
         t.samples.clear();
+        t.reset_trim();
         format!("TRACK {} CLEARED", self.selected + 1)
     }
 
@@ -192,6 +260,27 @@ impl FourTrack {
         self.recording = true;
         self.playing = true;
         Ok("REC".to_string())
+    }
+
+    /// Universal record/stop: one button for all four tracks. Starting
+    /// arms every track (no per-track arming needed) and records; stopping
+    /// keeps every take and safes all tracks, so a stray `R` can't
+    /// punch over them afterwards. Stops any recording, universal or not.
+    pub fn toggle_record_all(&mut self) -> String {
+        if self.recording {
+            self.recording = false;
+            self.loop_len = self.longest();
+            for t in self.tracks.iter_mut() {
+                t.armed = false;
+            }
+            return "REC STOP - ALL SAFE".to_string();
+        }
+        for t in self.tracks.iter_mut() {
+            t.armed = true;
+        }
+        self.recording = true;
+        self.playing = true;
+        "REC ALL".to_string()
     }
 
     pub fn stop_rewind(&mut self) -> String {
@@ -250,10 +339,16 @@ impl FourTrack {
                     if recording && t.armed {
                         continue; // punch-in: monitor the input instead
                     }
-                    if pos < t.samples.len() {
-                        let avail = (t.samples.len() - pos).min(seg);
+                    // Trim window: only the overlap of this segment
+                    // with [trim_start, trim_end) sounds.
+                    let (ts, te) = (t.trim_start, t.trim_end_samples());
+                    let play_from = pos.max(ts);
+                    let play_to = (pos + seg).min(te);
+                    if play_from < play_to {
+                        let skip = play_from - pos;
+                        let avail = play_to - play_from;
                         for i in 0..avail {
-                            out[off + i] += t.samples[pos + i];
+                            out[off + skip + i] += t.samples[play_from + i];
                         }
                     }
                 }
@@ -469,5 +564,73 @@ mod tests {
         ft.process(&mut out, &[], None);
         assert!(out.iter().all(|&s| s == 0.25));
         assert_eq!(ft.playhead, 0);
+    }
+
+    #[test]
+    fn record_all_arms_every_track_and_stop_safes_all() {
+        let mut ft = FourTrack::new();
+        let m = ft.toggle_record_all();
+        assert_eq!(m, "REC ALL");
+        assert!(ft.recording && ft.playing);
+        assert!(ft.tracks.iter().all(|t| t.armed));
+        let block = master_block(100, 0.25);
+        let mut out = vec![0.0f32; 100];
+        ft.process(&mut out, &[], Some(&block));
+        for t in ft.tracks.iter() {
+            assert_eq!(t.samples.len(), 100);
+            assert!(t.samples.iter().all(|&s| (s - 0.25).abs() < 1e-6));
+        }
+        let m = ft.toggle_record_all();
+        assert_eq!(m, "REC STOP - ALL SAFE");
+        assert!(!ft.recording);
+        assert!(ft.tracks.iter().all(|t| !t.armed));
+        assert!(ft.tracks.iter().all(|t| t.samples.len() == 100)); // takes kept
+    }
+
+    #[test]
+    fn record_all_stops_a_normal_record_too() {
+        let mut ft = FourTrack::new();
+        ft.toggle_arm(); // track 1 only
+        ft.toggle_record().unwrap();
+        assert!(ft.recording);
+        ft.toggle_record_all();
+        assert!(!ft.recording);
+        assert!(ft.tracks.iter().all(|t| !t.armed));
+    }
+
+    #[test]
+    fn trim_window_gates_playback() {
+        let mut ft = FourTrack::new();
+        ft.tracks[0].samples = vec![0.5; 300];
+        ft.tracks[0].set_trim(100, Some(200));
+        ft.toggle_play();
+        let mut out = vec![0.0f32; 300];
+        ft.process(&mut out, &[], None);
+        assert!(out[..100].iter().all(|&s| s == 0.0), "before window: silent");
+        assert!(out[100..200].iter().all(|&s| (s - 0.5).abs() < 1e-6));
+        assert!(out[200..].iter().all(|&s| s == 0.0), "after window: silent");
+    }
+
+    #[test]
+    fn trim_nudges_clamp_and_clear_resets() {
+        let mut ft = FourTrack::new();
+        ft.tracks[0].samples = vec![0.5; 300];
+        let t = &mut ft.tracks[0];
+        t.nudge_trim_start(400); // past the end: clamps to end
+        assert_eq!(t.trim_start, 300);
+        t.nudge_trim_start(-500); // below zero: clamps to 0
+        assert_eq!(t.trim_start, 0);
+        t.nudge_trim_end(-500); // below start: clamps to start
+        assert_eq!(t.trim_end, Some(0));
+        t.nudge_trim_end(9999); // past the track: clamps to len
+        assert_eq!(t.trim_end, Some(300));
+        assert_eq!(t.trim_label(), "FULL"); // 0..len reads as full
+        t.set_trim(50, Some(150));
+        assert!(t.is_trimmed());
+        assert_eq!(t.trimmed_region().len(), 100);
+        ft.clear_selected();
+        assert_eq!(ft.tracks[0].trim_start, 0);
+        assert_eq!(ft.tracks[0].trim_end, None);
+        assert!(ft.tracks[0].samples.is_empty());
     }
 }

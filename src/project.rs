@@ -166,6 +166,11 @@ pub struct NativePad {
     pub trim: [f32; 2],
     #[serde(default)]
     pub reverse: bool,
+    /// Loop region, fractions of the playable sample; off in older files.
+    #[serde(default = "def_trim")]
+    pub loop_pts: [f32; 2],
+    #[serde(default)]
+    pub loop_on: bool,
     #[serde(default)]
     pub locked: bool,
     #[serde(default)]
@@ -209,6 +214,12 @@ pub struct NativeTrack {
     pub muted: bool,
     #[serde(default = "def_track_source")]
     pub source: String, // "input" | "master"
+    /// Playback window start in samples; 0 in older files.
+    #[serde(default)]
+    pub trim_start: usize,
+    /// Playback window end in samples; None = to the end of the track.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trim_end: Option<usize>,
 }
 
 fn def_track_source() -> String {
@@ -293,6 +304,11 @@ pub fn apply_native(eng: &mut Engine, p: &NativeProject) {
             eng.pads[i].trim.1 = eng.pads[i].trim.0;
         }
         eng.pads[i].reverse = pad.reverse;
+        eng.pads[i].loop_pts = (
+            pad.loop_pts[0].clamp(0.0, 1.0),
+            pad.loop_pts[1].clamp(0.0, 1.0),
+        );
+        eng.pads[i].loop_enabled = pad.loop_on;
         eng.pads[i].rebuild();
         eng.set_filter(i, FilterKind::from_str(&pad.filter), pad.cutoff);
         eng.set_res(i, pad.res);
@@ -310,12 +326,16 @@ pub fn apply_native(eng: &mut Engine, p: &NativeProject) {
             t.armed = false;
             t.muted = false;
             t.source = TrackSource::Master;
+            t.trim_start = 0;
+            t.trim_end = None;
         }
         for (i, nt) in p.four_track.iter().enumerate().take(4) {
             let t = &mut ft.tracks[i];
             t.armed = nt.armed;
             t.muted = nt.muted;
             t.source = TrackSource::from_str(&nt.source);
+            t.trim_start = nt.trim_start;
+            t.trim_end = nt.trim_end;
             if let Some(a) = &nt.audio {
                 if let Ok(v) = f32_b64_decode(a) {
                     t.samples = v;
@@ -411,6 +431,8 @@ pub fn save_native(eng: &Engine, name: &str) -> String {
             choke: p.choke,
             trim: [p.trim.0, p.trim.1],
             reverse: p.reverse,
+            loop_pts: [p.loop_pts.0, p.loop_pts.1],
+            loop_on: p.loop_enabled,
             locked: p.locked,
             // The custom drum-mode sample, not the live `source`: when a
             // tape is loaded the source is chop audio, and saving that
@@ -444,6 +466,8 @@ pub fn save_native(eng: &Engine, name: &str) -> String {
             armed: t.armed,
             muted: t.muted,
             source: t.source.as_str().to_string(),
+            trim_start: t.trim_start,
+            trim_end: t.trim_end,
         })
         .collect();
     let p = NativeProject {
@@ -782,6 +806,9 @@ mod tests {
         e.set_locked(3, true);
         e.set_res(2, 3.5);
         e.set_mono(5, true);
+        e.nudge_loop(0, 0, 0.25);
+        e.nudge_loop(0, 1, -0.25);
+        e.toggle_loop(0);
         // 4-track: bounce a block of "pattern" onto track 1.
         e.four_track.toggle_arm();
         e.four_track.toggle_record().unwrap();
@@ -792,6 +819,7 @@ mod tests {
         e.four_track.toggle_record().unwrap();
         let take = e.four_track.tracks[0].samples.clone();
         assert!(!take.is_empty());
+        e.four_track.tracks[0].set_trim(10, Some(50));
         e.four_track.select(1);
         e.four_track.toggle_mute();
         e.four_track.toggle_source(); // -> INPUT
@@ -809,6 +837,12 @@ mod tests {
         assert!(!e2.pads[0].mono);
         // 4-track round-trips (audio + settings).
         assert_eq!(e2.four_track.tracks[0].samples, take);
+        assert_eq!(e2.four_track.tracks[0].trim_start, 10);
+        assert_eq!(e2.four_track.tracks[0].trim_end, Some(50));
+        // Pad loop points round-trip.
+        assert!(e2.pads[0].loop_enabled);
+        assert!((e2.pads[0].loop_pts.0 - 0.25).abs() < 1e-6);
+        assert!((e2.pads[0].loop_pts.1 - 0.75).abs() < 1e-6);
         assert!(e2.four_track.loop_enabled, "loop toggle round-trips");
         assert!(e2.four_track.tracks[0].armed);
         assert!(e2.four_track.tracks[1].muted);
