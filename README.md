@@ -88,7 +88,8 @@ mix. Each track has `A` arm, `I` input/master source, `M` mute, `X` clear;
 recording on armed tracks (starting playback), `U` is the universal
 record/stop button: it arms all four tracks and records, and stopping
 keeps every take and safes all four, so a stray `R` can't punch over
-them afterwards. `S` stops and rewinds.
+them afterwards. `U` works on every page, not just the tape page, and
+while recording a red `REC` shows in the header on every page. `S` stops and rewinds.
 `SPACE` still runs the pattern sequencer, so bouncing is: arm a track with
 `MASTER` source, hit `R`, hit `SPACE`, hit `R` again. Recording is
 punch-in style — the armed region is replaced, and armed tracks aren't

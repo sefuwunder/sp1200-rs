@@ -298,6 +298,13 @@ pub fn handle_event(ui: &mut Ui, eng: &mut Engine, ev: &Event) -> bool {
                 ui.cmdline = Some(String::new());
                 return false;
             }
+            // Universal record: U starts/stops tape recording from any
+            // page, exactly as on the Tape page (arms all four tracks;
+            // stopping keeps every take and safes all four).
+            if *k == Keycode::U {
+                tape_record(ui, eng, true);
+                return false;
+            }
             // Sample editor page keys (Tab/Up/Down handled here, the rest
             // falls through to the global keys below).
             if ui.page == Page::Edit {
@@ -415,15 +422,12 @@ pub fn handle_event(ui: &mut Ui, eng: &mut Engine, ev: &Event) -> bool {
             }
             // 4-track tape page keys (Tab/Esc handled here too).
             if ui.page == Page::Tape {
-                // R / U / B need the whole engine (pads + four-track),
+                // R / B need the whole engine (pads + four-track),
                 // so they run before the four-track borrow below.
+                // (U is handled globally above, so it works on every page.)
                 match *k {
                     Keycode::R => {
                         tape_record(ui, eng, false);
-                        return false;
-                    }
-                    Keycode::U => {
-                        tape_record(ui, eng, true);
                         return false;
                     }
                     Keycode::B => {
@@ -1023,11 +1027,21 @@ pub fn draw(p: &mut dyn Painter, ui: &Ui, eng: &Engine) {
     let bpm_s = format!("BPM {:03.0}", eng.bpm);
     let sw_s = format!("SWING {:02.0}%", eng.swing);
     let mst_s = format!("MASTER {:02.0}", eng.master * 100.0);
+    // Right-aligned readouts, drawn rightmost first; the red REC cue
+    // lands leftmost while tape recording is active, on every page.
+    let mut readouts: Vec<(&str, (u8, u8, u8))> = vec![
+        (mst_s.as_str(), TEXT),
+        (sw_s.as_str(), TEXT),
+        (bpm_s.as_str(), TEXT),
+    ];
+    if eng.four_track.recording {
+        readouts.push(("REC", REC));
+    }
     let mut rx = W as i32 - 24;
-    for s in [&mst_s, &sw_s, &bpm_s] {
+    for (s, c) in readouts {
         let w = text_w(s, 2) as i32;
         rx -= w;
-        p.text(rx, 26, s, 2, TEXT);
+        p.text(rx, 26, s, 2, c);
         rx -= 36;
     }
     p.text(24, 84, "PADS", 1, DIM);
@@ -1285,6 +1299,13 @@ fn draw_edit(p: &mut dyn Painter, ui: &Ui, eng: &Engine) {
     p.rect(0, 0, W, 76, PLATE);
     p.text(24, 22, "SP-1200 RS", 3, TEXT);
     p.text(24, 52, "SAMPLE EDITOR", 1, DIM);
+    // Red REC cue in the header while tape recording is active,
+    // matching the Pads and Tape pages.
+    if eng.four_track.recording {
+        let s = "REC";
+        let w = text_w(s, 2) as i32;
+        p.text(W as i32 - 24 - w, 26, s, 2, REC);
+    }
 
     let i = ui.selected_pad;
     let pad = &eng.pads[i];
@@ -1889,6 +1910,66 @@ mod tests {
         assert_eq!(eng.pads[0].sample, vec![1024i16; 1000]);
         assert!(eng.pads[0].custom);
         assert_eq!(eng.pads[0].label.as_deref(), Some("TRK1"));
+    }
+
+    #[test]
+    fn u_record_all_works_on_pads_and_edit_pages() {
+        let key = |kc| Event::KeyDown {
+            timestamp: 0,
+            window_id: 0,
+            keycode: Some(kc),
+            scancode: None,
+            keymod: sdl2::keyboard::Mod::NOMOD,
+            repeat: false,
+        };
+        for page in [Page::Pads, Page::Edit] {
+            let mut eng = Engine::new();
+            let mut ui = Ui::new();
+            ui.page = page;
+            handle_event(&mut ui, &mut eng, &key(Keycode::U));
+            assert!(eng.four_track.recording, "U starts recording on {page:?}");
+            assert!(eng.four_track.tracks.iter().all(|t| t.armed));
+            handle_event(&mut ui, &mut eng, &key(Keycode::U));
+            assert!(!eng.four_track.recording, "U stops recording on {page:?}");
+            assert!(eng.four_track.tracks.iter().all(|t| !t.armed));
+        }
+    }
+
+    /// Painter that captures text calls (color + row) instead of drawing.
+    struct TextCap {
+        texts: Vec<(String, i32, (u8, u8, u8))>,
+    }
+    impl Painter for TextCap {
+        fn rect(&mut self, _x: i32, _y: i32, _w: u32, _h: u32, _c: (u8, u8, u8)) {}
+        fn text(&mut self, _x: i32, y: i32, s: &str, _scale: u32, c: (u8, u8, u8)) {
+            self.texts.push((s.to_string(), y, c));
+        }
+    }
+
+    #[test]
+    fn header_rec_cue_on_pads_and_edit_pages() {
+        for page in [Page::Pads, Page::Edit] {
+            let mut eng = Engine::new();
+            let mut ui = Ui::new();
+            ui.page = page;
+            let mut cap = TextCap { texts: Vec::new() };
+            draw(&mut cap, &ui, &eng);
+            assert!(
+                !cap.texts.iter().any(|(s, _, _)| s == "REC"),
+                "no REC cue on {page:?} while idle"
+            );
+            eng.four_track.toggle_record_all();
+            assert!(eng.four_track.recording);
+            let mut cap = TextCap { texts: Vec::new() };
+            draw(&mut cap, &ui, &eng);
+            assert!(
+                cap.texts
+                    .iter()
+                    .any(|(s, y, c)| s == "REC" && *y == 26 && *c == REC),
+                "red REC cue in the header on {page:?} while recording: {:?}",
+                cap.texts
+            );
+        }
     }
 
     #[test]
