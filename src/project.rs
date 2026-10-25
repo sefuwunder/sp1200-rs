@@ -248,6 +248,11 @@ pub struct NativeProject {
     /// 4-track loop toggle; off in older files.
     #[serde(default)]
     pub four_track_loop: bool,
+    /// Tape-bus warmth/distortion in percent; 0 in older files.
+    #[serde(default)]
+    pub four_track_warmth: f32,
+    #[serde(default)]
+    pub four_track_distortion: f32,
 }
 
 fn def_bpm() -> f64 {
@@ -347,6 +352,8 @@ pub fn apply_native(eng: &mut Engine, p: &NativeProject) {
         ft.recording = false;
         ft.selected = 0;
         ft.loop_enabled = p.four_track_loop;
+        ft.set_warmth(p.four_track_warmth);
+        ft.set_distortion(p.four_track_distortion);
         ft.loop_len = 0;
     }
     match &p.tape {
@@ -482,6 +489,8 @@ pub fn save_native(eng: &Engine, name: &str) -> String {
         tape,
         four_track,
         four_track_loop: eng.four_track.loop_enabled,
+        four_track_warmth: eng.four_track.warmth * 100.0,
+        four_track_distortion: eng.four_track.distortion * 100.0,
     };
     serde_json::to_string_pretty(&p).unwrap_or_else(|_| "{}".to_string())
 }
@@ -714,6 +723,19 @@ pub fn load_project_file(eng: &mut Engine, path: &str) -> Result<String, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tape_bus_settings_round_trip_native() {
+        let mut eng = Engine::new();
+        eng.four_track.set_warmth(45.0);
+        eng.four_track.set_distortion(30.0);
+        let text = save_native(&eng, "BUS");
+        let np = parse_native(&text).unwrap();
+        let mut eng2 = Engine::new();
+        apply_native(&mut eng2, &np);
+        assert!((eng2.four_track.warmth - 0.45).abs() < 1e-6);
+        assert!((eng2.four_track.distortion - 0.30).abs() < 1e-6);
+    }
 
     #[test]
     fn b64_vectors() {

@@ -155,6 +155,19 @@ pub struct FourTrack {
     /// recording; frozen when recording starts so a first take can
     /// define its own length and overdubs wrap around existing material.
     pub loop_len: usize,
+    /// Tape-bus character, 0.0..1.0 (shown as 0-100%). Applied to the
+    /// tape playback/monitor mix only — never baked into takes.
+    /// Warmth is asymmetric tube-style saturation (even harmonics) plus
+    /// gentle high-end softening; distortion is symmetric tape-style
+    /// saturation. Both bypass bit-exactly at 0.
+    pub warmth: f32,
+    pub distortion: f32,
+    /// Warmth-stage filter state (DC blocker + one-pole lowpass). These
+    /// advance on every bus sample even while warmth is bypassed, so
+    /// re-enabling it never clicks.
+    warm_dc_in: f32,
+    warm_dc_out: f32,
+    warm_lp: f32,
 }
 
 impl FourTrack {
@@ -167,7 +180,67 @@ impl FourTrack {
             recording: false,
             loop_enabled: false,
             loop_len: 0,
+            warmth: 0.0,
+            distortion: 0.0,
+            warm_dc_in: 0.0,
+            warm_dc_out: 0.0,
+            warm_lp: 0.0,
         }
+    }
+
+    /// Set tube warmth in percent (0-100), clamped.
+    pub fn set_warmth(&mut self, pct: f32) {
+        self.warmth = (pct / 100.0).clamp(0.0, 1.0);
+    }
+
+    /// Set tape distortion in percent (0-100), clamped.
+    pub fn set_distortion(&mut self, pct: f32) {
+        self.distortion = (pct / 100.0).clamp(0.0, 1.0);
+    }
+
+    /// Nudge tube warmth by delta percent, returning the new percent.
+    pub fn nudge_warmth(&mut self, delta_pct: f32) -> f32 {
+        self.set_warmth(self.warmth * 100.0 + delta_pct);
+        self.warmth * 100.0
+    }
+
+    /// Nudge tape distortion by delta percent, returning the new percent.
+    pub fn nudge_distortion(&mut self, delta_pct: f32) -> f32 {
+        self.set_distortion(self.distortion * 100.0 + delta_pct);
+        self.distortion * 100.0
+    }
+
+    /// Tape-bus processing for one mix sample: tube warmth (asymmetric
+    /// saturation + DC block + softening lowpass) into tape distortion
+    /// (symmetric saturation). At 0/0 this returns the input untouched.
+    fn tape_bus(&mut self, x: f32) -> f32 {
+        // Warmth stage always advances its filter state so toggling it
+        // on mid-stream never clicks; its output is used only when on.
+        let warmed = self.warm_stage(x);
+        let mut y = if self.warmth > 0.0 { warmed } else { x };
+        if self.distortion > 0.0 {
+            let drive = 1.0 + self.distortion * 7.0;
+            y = (y * drive).tanh() / drive;
+        }
+        y
+    }
+
+    /// Asymmetric saturator: the x^2 term adds even harmonics (tube
+    /// character), the tanh bounds it, and dividing by drive keeps
+    /// small-signal gain at 1. Followed by a DC blocker (the asymmetry
+    /// rectifies a DC offset, as a real coupling cap would remove) and
+    /// a lowpass that darkens from 18 kHz to 8 kHz across the range.
+    fn warm_stage(&mut self, x: f32) -> f32 {
+        let w = self.warmth;
+        let drive = 1.0 + w * 2.0;
+        let v = (x * drive + w * 0.35 * x * x).tanh() / drive;
+        let dc = v - self.warm_dc_in + 0.995 * self.warm_dc_out;
+        self.warm_dc_in = v;
+        self.warm_dc_out = dc;
+        let fc = 18000.0 - 10000.0 * w;
+        let a = 1.0 - (-2.0 * std::f32::consts::PI * fc / SP_RATE as f32).exp();
+        self.warm_lp += a * (dc - self.warm_lp);
+        self.warm_lp
     }
 
     pub fn select(&mut self, i: usize) {
@@ -316,6 +389,12 @@ impl FourTrack {
         let n = out.len();
         let recording = self.recording;
         let playing = self.playing;
+        // Tape-bus FX run on the tape mix alone (never the pattern
+        // voices already in `out`). When both are off, accumulate
+        // straight into `out` as before, so the bypass is bit-identical.
+        let fx_on = self.warmth > 0.0 || self.distortion > 0.0;
+        let mut mix = if fx_on { vec![0.0f32; n] } else { Vec::new() };
+        let acc: &mut [f32] = if fx_on { &mut mix } else { out };
         if !recording {
             self.loop_len = self.longest();
         }
@@ -348,7 +427,7 @@ impl FourTrack {
                         let skip = play_from - pos;
                         let avail = play_to - play_from;
                         for i in 0..avail {
-                            out[off + skip + i] += t.samples[play_from + i];
+                            acc[off + skip + i] += t.samples[play_from + i];
                         }
                     }
                 }
@@ -376,7 +455,7 @@ impl FourTrack {
                 // Monitor live input while recording it.
                 if monitoring_input {
                     for i in 0..seg {
-                        out[off + i] += input.get(off + i).copied().unwrap_or(0.0);
+                        acc[off + i] += input.get(off + i).copied().unwrap_or(0.0);
                     }
                 }
             }
@@ -384,6 +463,13 @@ impl FourTrack {
             pos += seg;
         }
         self.playhead = pos;
+
+        // Fold the effected tape mix into the output.
+        if fx_on {
+            for i in 0..n {
+                out[i] += self.tape_bus(mix[i]);
+            }
+        }
 
         if !loop_on && playing && !recording && self.playhead >= self.longest() {
             self.playing = false;
@@ -632,5 +718,79 @@ mod tests {
         assert_eq!(ft.tracks[0].trim_start, 0);
         assert_eq!(ft.tracks[0].trim_end, None);
         assert!(ft.tracks[0].samples.is_empty());
+    }
+
+    #[test]
+    fn tape_bus_bypass_is_identity() {
+        let mut ft = FourTrack::new();
+        for x in [-2.0f32, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0] {
+            assert_eq!(ft.tape_bus(x), x, "0/0 must pass {x} through untouched");
+        }
+    }
+
+    #[test]
+    fn warmth_is_asymmetric_and_saturates() {
+        // Tube signature: positive and negative halves differ (even
+        // harmonics), unlike symmetric saturation.
+        let mut pos = FourTrack::new();
+        pos.set_warmth(100.0);
+        let a = pos.tape_bus(0.5);
+        let mut neg = FourTrack::new();
+        neg.set_warmth(100.0);
+        let b = neg.tape_bus(-0.5);
+        assert!(a != -b, "warmth must be asymmetric: {a} vs {b}");
+        assert!(a < 0.5 && a > 0.1, "warmth saturates but keeps level: {a}");
+        let mut hot = FourTrack::new();
+        hot.set_warmth(100.0);
+        assert!(hot.tape_bus(2.0) < 1.0, "hot signal squashed");
+    }
+
+    #[test]
+    fn distortion_squashes_symmetrically() {
+        let mut ft = FourTrack::new();
+        ft.set_distortion(100.0);
+        assert!(ft.tape_bus(2.0) < 0.2, "hot signal heavily squashed");
+        let mut ft = FourTrack::new();
+        ft.set_distortion(100.0);
+        let s = ft.tape_bus(0.1);
+        assert!(s > 0.05 && s < 0.15, "quiet signal stays near level: {s}");
+        let mut pos = FourTrack::new();
+        pos.set_distortion(100.0);
+        let a = pos.tape_bus(0.5);
+        let mut neg = FourTrack::new();
+        neg.set_distortion(100.0);
+        let b = neg.tape_bus(-0.5);
+        assert!((a + b).abs() < 1e-6, "distortion stays symmetric: {a} vs {b}");
+    }
+
+    #[test]
+    fn process_fx_changes_mix_but_never_bakes_into_takes() {
+        // Playback mix through the bus.
+        let mut ft = FourTrack::new();
+        ft.tracks[0].samples = vec![0.5; 200];
+        ft.toggle_play();
+        let mut clean = vec![0.0f32; 100];
+        ft.process(&mut clean, &[], None);
+        assert!(clean.iter().all(|&s| (s - 0.5).abs() < 1e-6));
+        ft.stop_rewind();
+        ft.set_warmth(100.0);
+        ft.toggle_play();
+        let mut warm = vec![0.0f32; 100];
+        ft.process(&mut warm, &[], None);
+        assert!(
+            warm.iter().any(|&s| (s - 0.5).abs() > 1e-3),
+            "warmth must audibly change the mix"
+        );
+        // Takes stay clean: recording with warmth on still stores the
+        // raw input, so the character is monitoring-only.
+        let mut ft = FourTrack::new();
+        ft.set_warmth(100.0);
+        ft.set_distortion(100.0);
+        ft.toggle_arm(); // track 1, MASTER source
+        ft.toggle_record().unwrap();
+        let m = master_block(100, 0.5);
+        let mut out = vec![0.0f32; 100];
+        ft.process(&mut out, &[], Some(&m));
+        assert!(ft.tracks[0].samples.iter().all(|&s| (s - 0.5).abs() < 1e-6));
     }
 }

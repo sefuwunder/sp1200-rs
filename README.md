@@ -96,6 +96,14 @@ played back while recording (no feedback). The header shows `IN OK` /
 `IN NONE` for the capture device. Track audio and settings are saved into
 native projects.
 
+Tape-bus character: `WARMTH` (tube-style saturation, 0–100%) and
+`DISTORT` (tape-style saturation, 0–100%) shape the tape playback and
+monitor mix only — takes always stay clean, so the character is
+non-destructive. Set them exactly with `:warmth N` / `:distort N`, or
+nudge in 5% steps on the tape page with `[` / `]` (warmth) and
+Shift+`[` / Shift+`]` (distortion); both values show under the tape
+header. Saved into native projects.
+
 Trim is a non-destructive playback window per track: `,` / `.` nudge the
 selected track's trim start, `;` / `'` its trim end, in 0.1 s steps — a
 trimmed track stays silent outside its window, and trimming never deletes

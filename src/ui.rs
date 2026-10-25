@@ -527,6 +527,32 @@ pub fn handle_event(ui: &mut Ui, eng: &mut Engine, ev: &Event) -> bool {
                         ui.say(m);
                         true
                     }
+                    // Tape-bus character in 5% steps: plain brackets
+                    // adjust warmth, shifted brackets distortion.
+                    Keycode::LeftBracket => {
+                        let shifted =
+                            keymod.intersects(Mod::LSHIFTMOD | Mod::RSHIFTMOD);
+                        if shifted {
+                            let v = ft.nudge_distortion(-5.0);
+                            ui.say(format!("DISTORT {:03.0}%", v));
+                        } else {
+                            let v = ft.nudge_warmth(-5.0);
+                            ui.say(format!("WARMTH {:03.0}%", v));
+                        }
+                        true
+                    }
+                    Keycode::RightBracket => {
+                        let shifted =
+                            keymod.intersects(Mod::LSHIFTMOD | Mod::RSHIFTMOD);
+                        if shifted {
+                            let v = ft.nudge_distortion(5.0);
+                            ui.say(format!("DISTORT {:03.0}%", v));
+                        } else {
+                            let v = ft.nudge_warmth(5.0);
+                            ui.say(format!("WARMTH {:03.0}%", v));
+                        }
+                        true
+                    }
                     _ => false,
                 };
                 if handled {
@@ -838,7 +864,7 @@ fn run_command(ui: &mut Ui, eng: &mut Engine, input: &str) -> bool {
     };
     let num = |s: &str| s.parse::<f64>().ok();
     match cmd.as_str() {
-        "help" => ui.say("W SAVE Q QUIT BPM SWING PAD TRACK LOOP TTRIM RESAMPLE REC STOP PLAY - SEE README"),
+        "help" => ui.say("W SAVE Q QUIT BPM SWING PAD TRACK LOOP TTRIM RESAMPLE REC STOP PLAY WARMTH DISTORT - SEE README"),
         "w" => save_project(ui, eng),
         "q" => return true,
         "bpm" => match num(next_arg(&mut parts)) {
@@ -854,6 +880,20 @@ fn run_command(ui: &mut Ui, eng: &mut Engine, input: &str) -> bool {
                 ui.say(format!("SWING {:02.0}%", eng.swing));
             }
             None => ui.say_err("USAGE: :SWING 62"),
+        },
+        "warmth" => match num(next_arg(&mut parts)) {
+            Some(n) => {
+                eng.four_track.set_warmth(n as f32);
+                ui.say(format!("WARMTH {:03.0}%", eng.four_track.warmth * 100.0));
+            }
+            None => ui.say_err("USAGE: :WARMTH 50"),
+        },
+        "distort" => match num(next_arg(&mut parts)) {
+            Some(n) => {
+                eng.four_track.set_distortion(n as f32);
+                ui.say(format!("DISTORT {:03.0}%", eng.four_track.distortion * 100.0));
+            }
+            None => ui.say_err("USAGE: :DISTORT 50"),
         },
         "pad" => match next_arg(&mut parts).parse::<usize>() {
             Ok(n) if (1..=8).contains(&n) => {
@@ -1183,6 +1223,23 @@ fn draw_tape(p: &mut dyn Painter, ui: &Ui, eng: &Engine) {
         rx -= w;
         p.text(rx, 26, &ls, 2, LOOPC);
     }
+
+    // Tape-bus character, always visible on the tape page.
+    p.text(
+        24,
+        82,
+        &format!(
+            "WARMTH {:03.0}%   DISTORT {:03.0}%",
+            ft.warmth * 100.0,
+            ft.distortion * 100.0
+        ),
+        1,
+        if ft.warmth > 0.0 || ft.distortion > 0.0 {
+            SEL
+        } else {
+            DIM
+        },
+    );
 
     // Track strips.
     for t in 0..N_TRACKS {
@@ -1840,6 +1897,14 @@ mod tests {
         assert_eq!(eng.bpm, 0.0);
         assert!(!run_command(&mut ui, &mut eng, "swing 55"));
         assert_eq!(eng.swing, 55.0);
+        assert!(!run_command(&mut ui, &mut eng, "warmth 50"));
+        assert_eq!(eng.four_track.warmth, 0.5);
+        assert!(!run_command(&mut ui, &mut eng, "warmth 150")); // clamped
+        assert_eq!(eng.four_track.warmth, 1.0);
+        assert!(!run_command(&mut ui, &mut eng, "warmth -10")); // clamped
+        assert_eq!(eng.four_track.warmth, 0.0);
+        assert!(!run_command(&mut ui, &mut eng, "distort 25"));
+        assert_eq!(eng.four_track.distortion, 0.25);
         assert!(!run_command(&mut ui, &mut eng, "pad 3"));
         assert_eq!(ui.selected_pad, 2);
         assert!(!run_command(&mut ui, &mut eng, "track 2"));
