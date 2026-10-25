@@ -113,7 +113,7 @@ it.
 |---|---|
 | `:help` | List commands (one line; this file has the details) |
 | `:w` / `:q` | Save the project / quit |
-| `:bpm N` / `:swing N` | Set BPM (60–200) / swing (50–75%) |
+| `:bpm N` / `:swing N` | Set BPM (0–256; 0 parks the sequencer) / swing (50–75%) |
 | `:pad N` / `:track N` | Select pad (1–8) / 4-track track (1–4) |
 | `:loop` | Toggle looping on the selected pad |
 | `:loop on` / `:loop off` | Enable / disable looping |

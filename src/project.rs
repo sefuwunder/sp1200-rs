@@ -17,7 +17,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::dsp;
-use crate::engine::{Engine, Tape, N_PADS};
+use crate::engine::{BPM_MAX, BPM_MIN, Engine, Tape, N_PADS};
 
 // ---------- hand-rolled base64 (decode only; ~30 lines, no extra deps) ----------
 
@@ -278,7 +278,7 @@ pub fn parse_native(json: &str) -> Result<NativeProject, String> {
 /// Apply a parsed native project. Infallible — call only after `parse_native`.
 pub fn apply_native(eng: &mut Engine, p: &NativeProject) {
     use crate::dsp::FilterKind;
-    eng.bpm = p.bpm.clamp(60.0, 200.0);
+    eng.bpm = p.bpm.clamp(BPM_MIN, BPM_MAX);
     eng.swing = p.swing.clamp(50.0, 75.0);
     eng.master = p.master.clamp(0.0, 1.0);
     for (i, pad) in p.pads.iter().enumerate() {
@@ -640,7 +640,7 @@ fn prepare_web(p: &WebProject) -> Result<PreparedWeb, String> {
         None => None,
     };
     Ok(PreparedWeb {
-        bpm: p.bpm.unwrap_or(100.0).clamp(60.0, 200.0),
+        bpm: p.bpm.unwrap_or(100.0).clamp(BPM_MIN, BPM_MAX),
         swing: p.swing.unwrap_or(60.0).clamp(50.0, 75.0),
         master: (p.master.unwrap_or(80.0) / 100.0).clamp(0.0, 1.0) as f32,
         pads,

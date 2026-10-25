@@ -25,6 +25,12 @@ pub const RENDER_SEED: u32 = 0x12_345678;
 /// Default filter cutoff when a filter is first engaged.
 pub const FILTER_DEFAULT_CUTOFF: f32 = 3000.0;
 
+/// BPM range: 0 parks the sequencer (manual pad triggers still sound),
+/// 256 is the top. Every clamp in the UI and project loaders uses these
+/// so the range can't drift apart again.
+pub const BPM_MIN: f64 = 0.0;
+pub const BPM_MAX: f64 = 256.0;
+
 pub struct Pad {
     /// Playable sample: trim + reverse applied to `source`.
     pub sample: Vec<i16>,
@@ -771,7 +777,10 @@ impl Engine {
     pub fn render(&mut self, out: &mut [f32]) {
         let d = dsp::sixteenth_dur(self.bpm);
         for s in out.iter_mut() {
-            while self.playing && self.clock >= self.next_step_at {
+            // BPM 0 parks the sequencer: steps never fire (sixteenth_dur
+            // would be infinite and the step time would overflow), but
+            // voices and manual pad triggers still sound.
+            while self.bpm > 0.0 && self.playing && self.clock >= self.next_step_at {
                 self.fire_step(self.sched_step);
                 self.sched_step += 1;
                 let bar = self.sched_step / N_STEPS as u64;
@@ -1305,6 +1314,38 @@ mod tests {
         assert!(e.resample_track_to_pad(0, 0).is_err());
         assert!(e.resample_track_to_pad(4, 0).is_err());
         assert!(e.resample_track_to_pad(0, 8).is_err());
+    }
+
+    #[test]
+    fn bpm_zero_parks_sequencer_without_panic() {
+        let mut e = Engine::new();
+        e.patterns[0][0] = true;
+        e.play();
+        e.bpm = 0.0;
+        // 100k samples at 0 BPM: no step ever fires (the step time
+        // would be infinite), and nothing overflows or panics.
+        let mut out = vec![0.0f32; 100_000];
+        e.render(&mut out);
+        assert_eq!(e.sched_step, 0);
+        assert_eq!(e.last_step, 0);
+        // Manual pad triggers still sound at 0 BPM.
+        e.trigger(0);
+        let mut out2 = vec![0.0f32; 1000];
+        e.render(&mut out2);
+        assert!(out2.iter().any(|&s| s != 0.0));
+    }
+
+    #[test]
+    fn bpm_256_steps_fire() {
+        let mut e = Engine::new();
+        e.patterns[0][0] = true;
+        e.play();
+        e.bpm = 256.0;
+        // A 16th at 256 BPM is ~1525 samples; 100k samples must fire
+        // many steps.
+        let mut out = vec![0.0f32; 100_000];
+        e.render(&mut out);
+        assert!(e.sched_step > 4);
     }
 
     #[test]

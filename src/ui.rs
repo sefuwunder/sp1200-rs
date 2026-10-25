@@ -16,7 +16,7 @@ use sdl2::video::Window;
 use std::time::Instant;
 
 use crate::dsp::SP_RATE;
-use crate::engine::{Engine, N_CHOKE_GROUPS, N_PADS, N_STEPS};
+use crate::engine::{Engine, BPM_MAX, BPM_MIN, N_CHOKE_GROUPS, N_PADS, N_STEPS};
 use crate::fourtrack::{TrackSource, N_TRACKS};
 
 pub const W: u32 = 1024;
@@ -589,7 +589,7 @@ pub fn handle_event(ui: &mut Ui, eng: &mut Engine, ev: &Event) -> bool {
                             .collect();
                         let avg = iv.iter().sum::<f64>() / iv.len() as f64;
                         if avg > 0.0 {
-                            eng.bpm = (60.0 / avg).clamp(60.0, 200.0).round();
+                            eng.bpm = (60.0 / avg).clamp(BPM_MIN, BPM_MAX).round();
                         }
                     }
                 }
@@ -597,8 +597,8 @@ pub fn handle_event(ui: &mut Ui, eng: &mut Engine, ev: &Event) -> bool {
                 Keycode::Right => eng.swing = (eng.swing + 1.0).clamp(50.0, 75.0),
                 Keycode::Up => eng.master = (eng.master + 0.05).clamp(0.0, 1.0),
                 Keycode::Down => eng.master = (eng.master - 0.05).clamp(0.0, 1.0),
-                Keycode::Comma => eng.bpm = (eng.bpm - 1.0).clamp(60.0, 200.0),
-                Keycode::Period => eng.bpm = (eng.bpm + 1.0).clamp(60.0, 200.0),
+                Keycode::Comma => eng.bpm = (eng.bpm - 1.0).clamp(BPM_MIN, BPM_MAX),
+                Keycode::Period => eng.bpm = (eng.bpm + 1.0).clamp(BPM_MIN, BPM_MAX),
                 Keycode::F1 => {
                     eng.apply_preset(0);
                     ui.preset = 0;
@@ -839,7 +839,7 @@ fn run_command(ui: &mut Ui, eng: &mut Engine, input: &str) -> bool {
         "q" => return true,
         "bpm" => match num(next_arg(&mut parts)) {
             Some(n) => {
-                eng.bpm = n.clamp(60.0, 200.0);
+                eng.bpm = n.clamp(BPM_MIN, BPM_MAX);
                 ui.say(format!("BPM {:03.0}", eng.bpm));
             }
             None => ui.say_err("USAGE: :BPM 120"),
@@ -1812,7 +1812,11 @@ mod tests {
         assert!(!run_command(&mut ui, &mut eng, "bpm 140"));
         assert_eq!(eng.bpm, 140.0);
         assert!(!run_command(&mut ui, &mut eng, "bpm 999")); // clamped
-        assert_eq!(eng.bpm, 200.0);
+        assert_eq!(eng.bpm, 256.0);
+        assert!(!run_command(&mut ui, &mut eng, "bpm 0"));
+        assert_eq!(eng.bpm, 0.0);
+        assert!(!run_command(&mut ui, &mut eng, "bpm -5")); // clamped
+        assert_eq!(eng.bpm, 0.0);
         assert!(!run_command(&mut ui, &mut eng, "swing 55"));
         assert_eq!(eng.swing, 55.0);
         assert!(!run_command(&mut ui, &mut eng, "pad 3"));
