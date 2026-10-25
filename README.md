@@ -6,7 +6,7 @@ The web app stays untouched; this is the same instrument compiled to a desktop
 binary.
 
 What it is: 8 synthesized drums through a 26.04 kHz / 12-bit signal path with
-varispeed tuning, Roger Linn swing, a 16-step sequencer, tape loading with
+varispeed tuning, Roger Linn swing, an 8–64-step sequencer, tape loading with
 onset/equal splicing (chop-to-pads), JSON project save/load (plus web
 `.sp1200.json` import), and an SP-1200-style 2D faceplate. Dependencies are
 `sdl2` (windowing/audio), `serde`/`serde_json` (project files — a pragmatic
@@ -37,6 +37,8 @@ time).
 |---|---|
 | `1`–`8` / click pad | Trigger pad (also selects it) |
 | Click step button | Toggle that step for the selected pad |
+| `-` / `=` | Sequence length −8 / +8 steps (8–64; steps past the length are kept) |
+| `[` / `]` | Step page back / forward (16 steps per page) |
 | `Space` | Play / stop |
 | `T` | Tap tempo (average of taps in the last 2 s) |
 | `,` / `.` | BPM −1 / +1 |
@@ -123,6 +125,7 @@ it.
 | `:help` | List commands (one line; this file has the details) |
 | `:w` / `:q` | Save the project / quit |
 | `:bpm N` / `:swing N` | Set BPM (0–256; 0 parks the sequencer) / swing (50–75%) |
+| `:steps N` | Set sequence length, 8–64 steps (clamped; exact values, unlike `-`/`=`) |
 | `:pad N` / `:track N` | Select pad (1–8) / 4-track track (1–4) |
 | `:loop` | Toggle looping on the selected pad |
 | `:loop on` / `:loop off` | Enable / disable looping |
@@ -150,7 +153,7 @@ drag-and-drop all accept `.wav` and `.mp3`.
 On load the tape is auto-spliced by onset detection; `S` re-splices, `E`
 slices into 8 equal parts, `D` clears it. Pads 1–8 trigger chops 1–8 (more
 than 8 chops: the first 8; the readout shows `8/N CHOPS`). Per-pad tune still
-applies — varispeed on chops, the classic. The 16-step sequencer keeps working
+applies — varispeed on chops, the classic. The step sequencer keeps working
 and fires chops like drums.
 
 ## Projects
@@ -159,7 +162,7 @@ and fires chops like drums.
 bpm, swing, master, per-pad tune/level (and optional per-pad chop override),
 per-pad filter (type + cutoff), choke group, trim, reverse, label, and any
 user-loaded sample (embedded base64, so the project is self-contained),
-the full 16-step pattern, and tape name + chop markers. Tape *audio* is not
+the full pattern, and tape name + chop markers. Tape *audio* is not
 embedded — load the project, then drop the `.wav`, and the saved chops apply
 to it. `sp1200-rs --project song.json` loads at startup; a dropped `.json`
 also sets the save path for `W`.
@@ -198,8 +201,8 @@ every run. It is the artifact the parity test compares.
   spirit.
 - `src/engine.rs` — 8 pads (i16 samples @ 26.04 kHz), per-pad tune (varispeed
   ratio) and level, 16-voice polyphonic allocator with oldest-voice stealing,
-  16-step per-pad sequencer with BPM + swing, live triggering alongside the
-  sequencer, 3 factory presets, tape state (name, 12-bit audio, chop regions;
+  8–64-step per-pad sequencer with BPM + swing, live triggering alongside the
+  sequencer, 3 factory presets (16-step; loading one resets the length to 16), tape state (name, 12-bit audio, chop regions;
   pads 1–8 play chops, `D` restores the drum factory), and the exact-integer
   offline renderer used by `--render`.
 - `src/wav.rs` — minimal zero-dependency WAV decoder (16-bit PCM / 32-bit

@@ -10,7 +10,13 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 pub const N_PADS: usize = 8;
-pub const N_STEPS: usize = 16;
+/// Step storage: every pattern holds up to 64 steps; `seq_len` (8..=64)
+/// selects how many actually play. Steps past the length are kept, so
+/// shortening then lengthening restores them.
+pub const MAX_STEPS: usize = 64;
+pub const MIN_STEPS: usize = 8;
+/// Steps shown per row on the Pads page; longer sequences page.
+pub const STEPS_PER_PAGE: usize = 16;
 pub const N_VOICES: usize = 16;
 
 /// Choke groups: 0 = none, 1..=4 = mute each other on trigger.
@@ -200,7 +206,9 @@ impl Voice {
 pub struct Engine {
     pub pads: Vec<Pad>,
     voices: [Voice; N_VOICES],
-    pub patterns: [[bool; N_STEPS]; N_PADS],
+    pub patterns: [[bool; MAX_STEPS]; N_PADS],
+    /// Playing sequence length, 8..=64 steps (default 16).
+    pub seq_len: usize,
     pub bpm: f64,
     pub swing: f64,
     pub master: f32,
@@ -250,7 +258,8 @@ impl Engine {
         let mut e = Self {
             pads,
             voices: [Voice::idle(); N_VOICES],
-            patterns: [[false; N_STEPS]; N_PADS],
+            patterns: [[false; MAX_STEPS]; N_PADS],
+            seq_len: 16,
             bpm: 100.0,
             swing: 60.0,
             master: 0.8,
@@ -722,8 +731,14 @@ impl Engine {
         })
     }
 
+    /// Set the playing sequence length, clamped to 8..=64. Steps past
+    /// the new length are kept, not cleared.
+    pub fn set_seq_len(&mut self, n: usize) {
+        self.seq_len = n.clamp(MIN_STEPS, MAX_STEPS);
+    }
+
     fn fire_step(&mut self, step: u64) {
-        let s = (step % N_STEPS as u64) as usize;
+        let s = (step % self.seq_len as u64) as usize;
         self.last_step = s as u32;
         for pad in 0..N_PADS {
             if self.patterns[pad][s] {
@@ -786,10 +801,10 @@ impl Engine {
             while self.bpm > 0.0 && self.playing && self.clock >= self.next_step_at {
                 self.fire_step(self.sched_step);
                 self.sched_step += 1;
-                let bar = self.sched_step / N_STEPS as u64;
-                let st = (self.sched_step % N_STEPS as u64) as u32;
+                let bar = self.sched_step / self.seq_len as u64;
+                let st = (self.sched_step % self.seq_len as u64) as u32;
                 let t =
-                    bar as f64 * N_STEPS as f64 * d + dsp::step_time16(st, self.bpm, self.swing);
+                    bar as f64 * self.seq_len as f64 * d + dsp::step_time16(st, self.bpm, self.swing);
                 self.next_step_at = self.pattern_start + js_round(t * SP_RATE) as u64;
             }
             let mut mix = 0.0f32;
@@ -875,7 +890,7 @@ impl Engine {
         const O: usize = 5;
         const T: usize = 6;
         const X: usize = 7; // shaker
-        let mut p = [[false; N_STEPS]; N_PADS];
+        let mut p = [[false; MAX_STEPS]; N_PADS];
         let mut on = |pad: usize, steps: &[usize]| {
             for &s in steps {
                 p[pad][s] = true;
@@ -916,6 +931,9 @@ impl Engine {
             }
         }
         self.patterns = p;
+        // Factory presets are 16-step patterns; loading one resets the
+        // length so stale steps past 16 can't leak into the preset.
+        self.seq_len = 16;
     }
 
     pub fn preset_name(idx: usize) -> &'static str {
@@ -1381,6 +1399,56 @@ mod tests {
         let mut out = vec![0.0f32; 100_000];
         e.render(&mut out);
         assert!(e.sched_step > 4);
+    }
+
+    #[test]
+    fn seq_len_default_clamps_and_keeps_steps() {
+        let mut e = Engine::new();
+        assert_eq!(e.seq_len, 16);
+        e.set_seq_len(4);
+        assert_eq!(e.seq_len, 8);
+        e.set_seq_len(100);
+        assert_eq!(e.seq_len, 64);
+        e.set_seq_len(32);
+        assert_eq!(e.seq_len, 32);
+        // Shortening keeps steps past the length; lengthening restores them.
+        e.patterns[0][40] = true;
+        e.set_seq_len(16);
+        e.set_seq_len(64);
+        assert!(e.patterns[0][40]);
+    }
+
+    #[test]
+    fn sequencer_wraps_at_seq_len() {
+        // Step 20 fires with a 32-step sequence, never with an 8-step one.
+        let mut e = Engine::new();
+        e.set_seq_len(32);
+        e.patterns[3][20] = true;
+        e.play();
+        let mut out = vec![0.0f32; 300_000];
+        e.render(&mut out);
+        assert!(e.pad_hit_at[3] > 0, "step 20 never fired at len 32");
+        assert!(e.last_step < 32);
+
+        let mut e = Engine::new();
+        e.set_seq_len(8);
+        e.patterns[3][20] = true;
+        e.play();
+        let mut out = vec![0.0f32; 300_000];
+        e.render(&mut out);
+        assert_eq!(e.pad_hit_at[3], 0, "step 20 fired at len 8");
+        assert!(e.last_step < 8);
+    }
+
+    #[test]
+    fn preset_resets_to_16_steps() {
+        let mut e = Engine::new();
+        e.set_seq_len(32);
+        e.patterns[0][40] = true;
+        e.apply_preset(0);
+        assert_eq!(e.seq_len, 16);
+        assert!(!e.patterns[0][40]);
+        assert!(e.patterns[0][0]);
     }
 
     #[test]

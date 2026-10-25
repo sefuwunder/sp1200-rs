@@ -17,7 +17,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::dsp;
-use crate::engine::{BPM_MAX, BPM_MIN, Engine, Tape, N_PADS};
+use crate::engine::{BPM_MAX, BPM_MIN, Engine, MAX_STEPS, Tape, N_PADS};
 
 // ---------- hand-rolled base64 (decode only; ~30 lines, no extra deps) ----------
 
@@ -239,7 +239,18 @@ pub struct NativeProject {
     #[serde(default = "def_master")]
     pub master: f32,
     pub pads: [NativePad; 8],
-    pub pattern: [[bool; 16]; 8],
+    /// 8 pads x up to 64 steps. Older files carry 16-wide rows; short
+    /// rows pad with false, long rows truncate, so old projects load.
+    /// (Custom ser/de because serde's array impls stop at 32.)
+    #[serde(
+        serialize_with = "ser_pattern",
+        deserialize_with = "de_pattern",
+        default = "def_pattern"
+    )]
+    pub pattern: [[bool; MAX_STEPS]; 8],
+    /// Playing sequence length; 16 in older files (field absent).
+    #[serde(default = "def_seq_len")]
+    pub seq_len: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tape: Option<NativeTape>,
     /// 4-track tape; empty in older files.
@@ -257,6 +268,40 @@ pub struct NativeProject {
 
 fn def_bpm() -> f64 {
     100.0
+}
+
+fn def_pattern() -> [[bool; MAX_STEPS]; 8] {
+    [[false; MAX_STEPS]; 8]
+}
+
+fn def_seq_len() -> usize {
+    16
+}
+
+fn de_pattern<'de, D>(d: D) -> Result<[[bool; MAX_STEPS]; 8], D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let rows = Vec::<Vec<bool>>::deserialize(d)?;
+    let mut p = [[false; MAX_STEPS]; 8];
+    for (i, row) in rows.iter().take(8).enumerate() {
+        for (j, &v) in row.iter().take(MAX_STEPS).enumerate() {
+            p[i][j] = v;
+        }
+    }
+    Ok(p)
+}
+
+fn ser_pattern<S>(p: &[[bool; MAX_STEPS]; 8], s: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::SerializeSeq;
+    let mut seq = s.serialize_seq(Some(8))?;
+    for row in p.iter() {
+        seq.serialize_element(&row[..])?;
+    }
+    seq.end()
 }
 fn def_swing() -> f64 {
     60.0
@@ -322,6 +367,7 @@ pub fn apply_native(eng: &mut Engine, p: &NativeProject) {
         eng.pads[i].locked = pad.locked;
     }
     eng.patterns = p.pattern;
+    eng.set_seq_len(p.seq_len);
     // 4-track: restore audio + settings (transport always starts stopped).
     {
         use crate::fourtrack::TrackSource;
@@ -486,6 +532,7 @@ pub fn save_native(eng: &Engine, name: &str) -> String {
         master: eng.master,
         pads,
         pattern: eng.patterns,
+        seq_len: eng.seq_len,
         tape,
         four_track,
         four_track_loop: eng.four_track.loop_enabled,
@@ -914,6 +961,23 @@ mod tests {
         assert_eq!(e.pads[3].trim, (0.0, 1.0));
         assert!(!e.pads[3].reverse);
         assert!(!e.pads[3].custom);
+        // v1 patterns are 16-wide: rows pad with false, length is 16.
+        assert_eq!(e.seq_len, 16);
+        assert!(e.patterns.iter().all(|row| row[16..].iter().all(|&s| !s)));
+    }
+
+    #[test]
+    fn seq_len_and_long_pattern_round_trip() {
+        let mut e = sample_engine();
+        e.set_seq_len(32);
+        e.patterns[0][40] = true;
+        e.patterns[7][63] = true;
+        let json = save_native(&e, "longpattern");
+        let p = parse_native(&json).unwrap();
+        let mut e2 = Engine::new();
+        apply_native(&mut e2, &p);
+        assert_eq!(e2.seq_len, 32);
+        assert_eq!(e2.patterns, e.patterns);
     }
 
     #[test]

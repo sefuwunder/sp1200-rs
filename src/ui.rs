@@ -16,7 +16,7 @@ use sdl2::video::Window;
 use std::time::Instant;
 
 use crate::dsp::SP_RATE;
-use crate::engine::{Engine, BPM_MAX, BPM_MIN, N_CHOKE_GROUPS, N_PADS, N_STEPS};
+use crate::engine::{Engine, BPM_MAX, BPM_MIN, N_CHOKE_GROUPS, N_PADS, STEPS_PER_PAGE};
 use crate::fourtrack::{TrackSource, N_TRACKS};
 
 pub const W: u32 = 1024;
@@ -166,7 +166,7 @@ fn pad_rect(i: usize) -> (i32, i32, u32, u32) {
 fn step_rect(i: usize) -> (i32, i32, u32, u32) {
     let w = 56u32;
     let gap = 6u32;
-    let total = N_STEPS as u32 * w + (N_STEPS as u32 - 1) * gap;
+    let total = STEPS_PER_PAGE as u32 * w + (STEPS_PER_PAGE as u32 - 1) * gap;
     let x0 = (W - total) as i32 / 2;
     (x0 + i as i32 * (w as i32 + gap as i32), 452, w, 54)
 }
@@ -179,10 +179,21 @@ fn hit_pad(x: i32, y: i32) -> Option<usize> {
 }
 
 fn hit_step(x: i32, y: i32) -> Option<usize> {
-    (0..N_STEPS).find(|&i| {
+    (0..STEPS_PER_PAGE).find(|&i| {
         let (px, py, w, h) = step_rect(i);
         x >= px && x < px + w as i32 && y >= py && y < py + h as i32
     })
+}
+
+/// Step pages for a sequence length (16 steps per page).
+fn step_pages(seq_len: usize) -> usize {
+    (seq_len + STEPS_PER_PAGE - 1) / STEPS_PER_PAGE
+}
+
+/// Displayed step page, clamped so shrinking the sequence can never
+/// strand the view past the last page.
+fn step_page(ui: &Ui, eng: &Engine) -> usize {
+    ui.step_page.min(step_pages(eng.seq_len) - 1)
 }
 
 // ---------- ui state ----------
@@ -201,6 +212,7 @@ pub struct Browser {
 
 pub struct Ui {
     pub selected_pad: usize,
+    pub step_page: usize,
     pub preset: usize,
     taps: Vec<Instant>,
     /// Where `W` saves the project (set by --project or a dropped .json).
@@ -221,6 +233,7 @@ impl Ui {
     pub fn new() -> Self {
         Self {
             selected_pad: 0,
+            step_page: 0,
             preset: 0,
             taps: Vec::new(),
             project_path: None,
@@ -562,6 +575,48 @@ pub fn handle_event(ui: &mut Ui, eng: &mut Engine, ev: &Event) -> bool {
                 ui.page = Page::Edit;
                 return false;
             }
+            // Pads-page keys: step pages and sequence length. (Brackets
+            // and -/= are free here; Edit and Tape bind them themselves.)
+            if ui.page == Page::Pads {
+                let handled = match *k {
+                    Keycode::LeftBracket => {
+                        if ui.step_page > 0 {
+                            ui.step_page -= 1;
+                        }
+                        ui.say(format!(
+                            "STEP PAGE {}/{}",
+                            step_page(ui, eng) + 1,
+                            step_pages(eng.seq_len)
+                        ));
+                        true
+                    }
+                    Keycode::RightBracket => {
+                        if ui.step_page + 1 < step_pages(eng.seq_len) {
+                            ui.step_page += 1;
+                        }
+                        ui.say(format!(
+                            "STEP PAGE {}/{}",
+                            step_page(ui, eng) + 1,
+                            step_pages(eng.seq_len)
+                        ));
+                        true
+                    }
+                    Keycode::Minus => {
+                        eng.set_seq_len(eng.seq_len.saturating_sub(8));
+                        ui.say(format!("STEPS {}", eng.seq_len));
+                        true
+                    }
+                    Keycode::Equals => {
+                        eng.set_seq_len(eng.seq_len + 8);
+                        ui.say(format!("STEPS {}", eng.seq_len));
+                        true
+                    }
+                    _ => false,
+                };
+                if handled {
+                    return false;
+                }
+            }
             match *k {
                 Keycode::Escape => return true,
                 Keycode::A => {
@@ -687,7 +742,8 @@ pub fn handle_event(ui: &mut Ui, eng: &mut Engine, ev: &Event) -> bool {
                 eng.trigger(i);
             } else if let Some(s) = hit_step(*x, *y) {
                 let p = ui.selected_pad;
-                eng.patterns[p][s] = !eng.patterns[p][s];
+                let g = step_page(ui, eng) * STEPS_PER_PAGE + s;
+                eng.patterns[p][g] = !eng.patterns[p][g];
             }
         }
         _ => {}
@@ -864,7 +920,7 @@ fn run_command(ui: &mut Ui, eng: &mut Engine, input: &str) -> bool {
     };
     let num = |s: &str| s.parse::<f64>().ok();
     match cmd.as_str() {
-        "help" => ui.say("W SAVE Q QUIT BPM SWING PAD TRACK LOOP TTRIM RESAMPLE REC STOP PLAY WARMTH DISTORT - SEE README"),
+        "help" => ui.say("W SAVE Q QUIT BPM SWING PAD TRACK LOOP TTRIM RESAMPLE REC STOP PLAY WARMTH DISTORT STEPS - SEE README"),
         "w" => save_project(ui, eng),
         "q" => return true,
         "bpm" => match num(next_arg(&mut parts)) {
@@ -880,6 +936,13 @@ fn run_command(ui: &mut Ui, eng: &mut Engine, input: &str) -> bool {
                 ui.say(format!("SWING {:02.0}%", eng.swing));
             }
             None => ui.say_err("USAGE: :SWING 62"),
+        },
+        "steps" => match num(next_arg(&mut parts)) {
+            Some(n) => {
+                eng.set_seq_len(n as usize);
+                ui.say(format!("STEPS {}", eng.seq_len));
+            }
+            None => ui.say_err("USAGE: :STEPS 32"),
         },
         "warmth" => match num(next_arg(&mut parts)) {
             Some(n) => {
@@ -1136,26 +1199,41 @@ pub fn draw(p: &mut dyn Painter, ui: &Ui, eng: &Engine) {
         }
     }
 
-    // steps
-    p.text(24, 384, "STEPS", 1, DIM);
+    // steps: one 16-step page of the sequence, with length + page in
+    // the label (and the playhead's page when it is off-screen).
+    let page = step_page(ui, eng);
+    let pages = step_pages(eng.seq_len);
+    let mut steps_label =
+        format!("STEPS {} PG {}/{}", eng.seq_len, page + 1, pages);
+    if eng.playing {
+        let play_page = eng.last_step as usize / STEPS_PER_PAGE;
+        if play_page != page {
+            steps_label.push_str(&format!(" PLAY {}", play_page + 1));
+        }
+    }
+    p.text(24, 384, &steps_label, 1, DIM);
     let pat = eng.patterns[ui.selected_pad];
-    for i in 0..N_STEPS {
+    for i in 0..STEPS_PER_PAGE {
+        let g = page * STEPS_PER_PAGE + i;
+        if g >= eng.seq_len {
+            continue;
+        }
         let (x, y, w, h) = step_rect(i);
-        let is_head = eng.playing && eng.last_step as usize == i;
-        let led = if pat[i] { LED_ON } else { LED_OFF };
+        let is_head = eng.playing && eng.last_step as usize == g;
+        let led = if pat[g] { LED_ON } else { LED_OFF };
         let led_c = if is_head { PLAYHEAD } else { led };
         p.rect(x, y - 16, w, 10, led_c);
-        let fill = if pat[i] { STEP_ON } else { STEP_OFF };
+        let fill = if pat[g] { STEP_ON } else { STEP_OFF };
         p.rect(x, y, w, h, fill);
         if is_head {
             p.rect(x, y, w, 4, PLAYHEAD);
         }
-        let num = format!("{}", i + 1);
+        let num = format!("{}", g + 1);
         let tw = text_w(&num, 1) as i32;
         p.text(x + (w as i32 - tw) / 2, y + 20, &num, 1, DIM);
     }
     let sel_name = eng.pad_label(ui.selected_pad);
-    p.text(120, 384, &format!("EDITING: {}", sel_name), 1, SEL);
+    p.text(180, 384, &format!("EDITING: {}", sel_name), 1, SEL);
 
     // presets
     let mut px = 24;
@@ -1180,7 +1258,7 @@ pub fn draw(p: &mut dyn Painter, ui: &Ui, eng: &Engine) {
     p.text(
         24,
         584,
-        "SPACE PLAY/STOP  T TAP  TAB EDIT  A 4-TRACK  P PANIC  K LOCK  S/E SPLICE  D TAPE OFF  W SAVE  : CMDS  ESC QUIT",
+        "SPACE PLAY/STOP  T TAP  TAB EDIT  A 4-TRACK  P PANIC  K LOCK  S/E SPLICE  D TAPE OFF  W SAVE  : CMDS  ESC QUIT  -/= STEPS  [ ] PAGE",
         1,
         DIM,
     );
@@ -1948,6 +2026,80 @@ mod tests {
         assert!(!ui.msg.as_ref().unwrap().2);
         assert!(!run_command(&mut ui, &mut eng, ""));
         assert!(run_command(&mut ui, &mut eng, "q"));
+    }
+
+    #[test]
+    fn steps_command_clamps_and_pads_keys_page_and_length() {
+        let mut eng = Engine::new();
+        let mut ui = Ui::new();
+        assert!(!run_command(&mut ui, &mut eng, "steps 32"));
+        assert_eq!(eng.seq_len, 32);
+        assert!(!run_command(&mut ui, &mut eng, "steps 3")); // clamped
+        assert_eq!(eng.seq_len, 8);
+        assert!(!run_command(&mut ui, &mut eng, "steps 99")); // clamped
+        assert_eq!(eng.seq_len, 64);
+        assert!(!run_command(&mut ui, &mut eng, "steps"));
+        assert_eq!(eng.seq_len, 64); // usage error leaves it alone
+
+        let key = |kc, m| Event::KeyDown {
+            timestamp: 0,
+            window_id: 0,
+            keycode: Some(kc),
+            scancode: None,
+            keymod: m,
+            repeat: false,
+        };
+        let nomod = sdl2::keyboard::Mod::NOMOD;
+        ui.page = Page::Pads;
+        eng.set_seq_len(32);
+        // ] pages forward, clamped to the last page; [ pages back.
+        handle_event(&mut ui, &mut eng, &key(Keycode::RightBracket, nomod));
+        assert_eq!(ui.step_page, 1);
+        handle_event(&mut ui, &mut eng, &key(Keycode::RightBracket, nomod));
+        assert_eq!(ui.step_page, 1);
+        handle_event(&mut ui, &mut eng, &key(Keycode::LeftBracket, nomod));
+        assert_eq!(ui.step_page, 0);
+        // -/= move the length by 8, clamped to 8..=64.
+        handle_event(&mut ui, &mut eng, &key(Keycode::Minus, nomod));
+        assert_eq!(eng.seq_len, 24);
+        handle_event(&mut ui, &mut eng, &key(Keycode::Equals, nomod));
+        assert_eq!(eng.seq_len, 32);
+        for _ in 0..5 {
+            handle_event(&mut ui, &mut eng, &key(Keycode::Minus, nomod));
+        }
+        assert_eq!(eng.seq_len, 8);
+    }
+
+    #[test]
+    fn step_pages_draw_only_active_steps() {
+        let mut eng = Engine::new();
+        let mut ui = Ui::new();
+        eng.set_seq_len(32);
+        ui.step_page = 1;
+        let mut cap = TextCap { texts: Vec::new() };
+        draw(&mut cap, &ui, &eng);
+        let strs: Vec<&str> = cap.texts.iter().map(|(s, _, _)| s.as_str()).collect();
+        assert!(strs.contains(&"STEPS 32 PG 2/2"));
+        assert!(strs.contains(&"17"));
+        assert!(strs.contains(&"32"));
+        assert!(!strs.contains(&"33"));
+        // A page past the end clamps to the last page instead of drawing
+        // nothing (or panicking on an empty page range).
+        ui.step_page = 3;
+        let mut cap = TextCap { texts: Vec::new() };
+        draw(&mut cap, &ui, &eng);
+        let strs: Vec<&str> = cap.texts.iter().map(|(s, _, _)| s.as_str()).collect();
+        assert!(strs.contains(&"STEPS 32 PG 2/2"));
+        assert!(strs.contains(&"17"));
+        // 8 steps: one page, numbers 1-8 only.
+        eng.set_seq_len(8);
+        ui.step_page = 0;
+        let mut cap = TextCap { texts: Vec::new() };
+        draw(&mut cap, &ui, &eng);
+        let strs: Vec<&str> = cap.texts.iter().map(|(s, _, _)| s.as_str()).collect();
+        assert!(strs.contains(&"STEPS 8 PG 1/1"));
+        assert!(strs.contains(&"8"));
+        assert!(!strs.contains(&"9"));
     }
 
     #[test]
