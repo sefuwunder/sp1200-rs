@@ -85,11 +85,10 @@ Loop points are fractions of the pad's playable sample (so they survive trim/rev
 (the default audio capture device — mic/line-in) or bouncing the pattern
 mix. Each track has `A` arm, `I` input/master source, `M` mute, `X` clear;
 `1-4` selects the track. `ENTER` plays/stops the tape, `R` toggles
-recording on armed tracks (starting playback), `U` is the universal
-record/stop button: it arms all four tracks and records, and stopping
-keeps every take and safes all four, so a stray `R` can't punch over
-them afterwards. `U` works on every page, not just the tape page, and
-while recording a red `REC` shows in the header on every page. `S` stops and rewinds.
+recording on armed tracks (starting playback). `U` is the same
+record/stop button on every page: it records only to the track(s)
+you've armed with `A`, and stopping keeps every take (tracks stay
+armed). `:rec all` still arms all four at once. `S` stops and rewinds.
 `SPACE` still runs the pattern sequencer, so bouncing is: arm a track with
 `MASTER` source, hit `R`, hit `SPACE`, hit `R` again. Recording is
 punch-in style — the armed region is replaced, and armed tracks aren't

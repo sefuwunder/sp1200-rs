@@ -298,11 +298,11 @@ pub fn handle_event(ui: &mut Ui, eng: &mut Engine, ev: &Event) -> bool {
                 ui.cmdline = Some(String::new());
                 return false;
             }
-            // Universal record: U starts/stops tape recording from any
-            // page, exactly as on the Tape page (arms all four tracks;
-            // stopping keeps every take and safes all four).
+            // Record: U starts/stops tape recording on armed tracks
+            // from any page, the same as R on the Tape page
+            // (:rec all still arms all four).
             if *k == Keycode::U {
-                tape_record(ui, eng, true);
+                tape_record(ui, eng, false);
                 return false;
             }
             // Sample editor page keys (Tab/Up/Down handled here, the rest
@@ -424,7 +424,7 @@ pub fn handle_event(ui: &mut Ui, eng: &mut Engine, ev: &Event) -> bool {
             if ui.page == Page::Tape {
                 // R / B need the whole engine (pads + four-track),
                 // so they run before the four-track borrow below.
-                // (U is handled globally above, so it works on every page.)
+                // (U is handled globally above: same armed-only record.)
                 match *k {
                     Keycode::R => {
                         tape_record(ui, eng, false);
@@ -747,8 +747,8 @@ fn save_project(ui: &mut Ui, eng: &mut Engine) {
     }
 }
 
-/// Tape record, normal (`R`: armed tracks only) or universal (`U`:
-/// every track). Appends the no-input-device warning when an INPUT
+/// Tape record, normal (armed tracks only) or all (every track).
+/// Appends the no-input-device warning when an INPUT
 /// track is armed but no capture device exists.
 fn tape_record(ui: &mut Ui, eng: &mut Engine, all: bool) {
     let m = if all {
@@ -1886,7 +1886,7 @@ mod tests {
     }
 
     #[test]
-    fn tape_u_record_all_and_b_resample_keys() {
+    fn u_records_only_armed_tracks_and_b_resamples() {
         let mut eng = Engine::new();
         let mut ui = Ui::new();
         ui.page = Page::Tape;
@@ -1899,12 +1899,20 @@ mod tests {
             keymod: sdl2::keyboard::Mod::NOMOD,
             repeat: false,
         };
-        handle_event(&mut ui, &mut eng, &key(Keycode::U));
-        assert!(eng.four_track.recording);
-        assert!(eng.four_track.tracks.iter().all(|t| t.armed));
+        // Nothing armed: U refuses, it does not arm anything itself.
         handle_event(&mut ui, &mut eng, &key(Keycode::U));
         assert!(!eng.four_track.recording);
         assert!(eng.four_track.tracks.iter().all(|t| !t.armed));
+        // Arm track 1 only: U records to it and nothing else, and
+        // stopping keeps it armed (unlike the old arm-all behavior).
+        eng.four_track.toggle_arm();
+        handle_event(&mut ui, &mut eng, &key(Keycode::U));
+        assert!(eng.four_track.recording);
+        assert!(eng.four_track.tracks[0].armed);
+        assert!(eng.four_track.tracks[1..].iter().all(|t| !t.armed));
+        handle_event(&mut ui, &mut eng, &key(Keycode::U));
+        assert!(!eng.four_track.recording);
+        assert!(eng.four_track.tracks[0].armed);
         // B resamples the selected track (1) onto the same-number pad.
         handle_event(&mut ui, &mut eng, &key(Keycode::B));
         assert_eq!(eng.pads[0].sample, vec![1024i16; 1000]);
@@ -1913,7 +1921,7 @@ mod tests {
     }
 
     #[test]
-    fn u_record_all_works_on_pads_and_edit_pages() {
+    fn u_records_armed_tracks_on_every_page() {
         let key = |kc| Event::KeyDown {
             timestamp: 0,
             window_id: 0,
@@ -1926,12 +1934,19 @@ mod tests {
             let mut eng = Engine::new();
             let mut ui = Ui::new();
             ui.page = page;
+            // Nothing armed: U does not start recording anywhere.
+            handle_event(&mut ui, &mut eng, &key(Keycode::U));
+            assert!(!eng.four_track.recording, "U with no armed track on {page:?}");
+            // Arm track 2 only: U records to it alone, on every page.
+            eng.four_track.select(1);
+            eng.four_track.toggle_arm();
             handle_event(&mut ui, &mut eng, &key(Keycode::U));
             assert!(eng.four_track.recording, "U starts recording on {page:?}");
-            assert!(eng.four_track.tracks.iter().all(|t| t.armed));
+            assert!(!eng.four_track.tracks[0].armed);
+            assert!(eng.four_track.tracks[1].armed);
+            assert!(eng.four_track.tracks[2..].iter().all(|t| !t.armed));
             handle_event(&mut ui, &mut eng, &key(Keycode::U));
             assert!(!eng.four_track.recording, "U stops recording on {page:?}");
-            assert!(eng.four_track.tracks.iter().all(|t| !t.armed));
         }
     }
 
