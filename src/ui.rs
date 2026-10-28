@@ -925,7 +925,7 @@ fn run_command(ui: &mut Ui, eng: &mut Engine, input: &str) -> bool {
     };
     let num = |s: &str| s.parse::<f64>().ok();
     match cmd.as_str() {
-        "help" => ui.say("W SAVE Q QUIT BPM SWING PAD TRACK LOOP TTRIM RESAMPLE REC STOP PLAY WARMTH DISTORT STEPS - SEE README"),
+        "help" => ui.say("W SAVE Q QUIT BPM SWING PAD TRACK LOOP TTRIM RESAMPLE REC STOP PLAY WARMTH DISTORT STEPS CHOP - SEE README"),
         "w" => save_project(ui, eng),
         "q" => return true,
         "bpm" => match num(next_arg(&mut parts)) {
@@ -970,6 +970,49 @@ fn run_command(ui: &mut Ui, eng: &mut Engine, input: &str) -> bool {
             }
             _ => ui.say_err("USAGE: :PAD 1-8"),
         },
+        "chop" => {
+            // :CHOP 12 -> selected pad takes chop 12.
+            // :CHOP 3 12 -> pad 3 takes chop 12.
+            // :CHOP [PAD] CLEAR -> pad back to its default chop/drum.
+            // Numbers are 1-based, like the pad labels and the tape
+            // readout; chop counts above 8 are assignable too.
+            let a1 = next_arg(&mut parts);
+            let a2 = next_arg(&mut parts);
+            let parsed: Option<(usize, Option<usize>)> =
+                if a1.eq_ignore_ascii_case("clear") {
+                    Some((ui.selected_pad, None))
+                } else if a2.is_empty() {
+                    a1.parse::<usize>().ok().and_then(|c| {
+                        if c >= 1 {
+                            Some((ui.selected_pad, Some(c - 1)))
+                        } else {
+                            None
+                        }
+                    })
+                } else if a2.eq_ignore_ascii_case("clear") {
+                    a1.parse::<usize>().ok().and_then(|p| {
+                        if (1..=8).contains(&p) {
+                            Some((p - 1, None))
+                        } else {
+                            None
+                        }
+                    })
+                } else {
+                    match (a1.parse::<usize>(), a2.parse::<usize>()) {
+                        (Ok(p), Ok(c)) if (1..=8).contains(&p) && c >= 1 => {
+                            Some((p - 1, Some(c - 1)))
+                        }
+                        _ => None,
+                    }
+                };
+            match parsed {
+                Some((p, c)) => match eng.assign_chop(p, c) {
+                    Ok(m) => ui.say(m),
+                    Err(e) => ui.say_err(e),
+                },
+                None => ui.say_err("USAGE: :CHOP [PAD] CHOP OR :CHOP [PAD] CLEAR"),
+            }
+        }
         "track" => match next_arg(&mut parts).parse::<usize>() {
             Ok(n) if (1..=4).contains(&n) => {
                 eng.four_track.select(n - 1);
@@ -1960,6 +2003,31 @@ mod tests {
             &mut eng,
             &key(Keycode::Return, nomod)
         ));
+    }
+
+    #[test]
+    fn chop_command_assigns_and_clears() {
+        let mut eng = Engine::new();
+        let mut audio = Vec::new();
+        for _ in 0..12 {
+            audio.push(2047);
+            audio.extend(std::iter::repeat(300i16).take(3000));
+        }
+        eng.load_tape("T".to_string(), audio);
+        let mut ui = Ui::new();
+        // Two-arg form: pad 1 takes chop 12.
+        run_command(&mut ui, &mut eng, "chop 1 12");
+        assert_eq!(eng.pad_label(0), "CHOP 12");
+        // Clear form: pad 1 back to its own chop.
+        run_command(&mut ui, &mut eng, "chop 1 clear");
+        assert_eq!(eng.pad_label(0), "CHOP 1");
+        // Single-arg form targets the selected pad.
+        ui.selected_pad = 2;
+        run_command(&mut ui, &mut eng, "chop 12");
+        assert_eq!(eng.pad_label(2), "CHOP 12");
+        // Out-of-range chop is an error, not a silent no-op.
+        run_command(&mut ui, &mut eng, "chop 1 99");
+        assert_eq!(eng.pad_label(0), "CHOP 1");
     }
 
     #[test]

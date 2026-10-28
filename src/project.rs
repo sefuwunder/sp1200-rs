@@ -1002,7 +1002,31 @@ mod tests {
     }
 
     #[test]
-    fn native_round_trip_tape_audio() {
+    fn native_round_trip_chop_assignment() {
+        // An arbitrary assignment (pad 1 <- chop 12) survives save/load:
+        // the project stores the chop override, and load rebuilds the
+        // pad from it.
+        let mut e = Engine::new();
+        let mut audio = Vec::new();
+        for _ in 0..12 {
+            audio.push(2047);
+            audio.extend(std::iter::repeat(300i16).take(3000));
+        }
+        let n = e.load_tape("MANY".to_string(), audio.clone());
+        assert!(n >= 12, "got {n}");
+        e.assign_chop(0, Some(11)).unwrap();
+        let json = save_native(&e, "assigned");
+        let p = parse_native(&json).unwrap();
+        let mut e2 = Engine::new();
+        apply_native(&mut e2, &p);
+        assert_eq!(e2.chop_map[0], Some(11));
+        assert_eq!(e2.pad_label(0), "CHOP 12");
+        let (a, b) = e2.tape.as_ref().unwrap().chops[11];
+        assert_eq!(e2.pads[0].source, audio[a..b].to_vec());
+    }
+
+    #[test]
+    fn native_round_tape_audio() {
         // Tape audio is embedded now: pads playing chops survive save/load.
         let mut e = Engine::new();
         let audio: Vec<i16> = (0..3000).map(|i| (i % 251) as i16 - 125).collect();

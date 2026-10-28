@@ -70,7 +70,8 @@ pub struct Pad {
     pub loop_pts: (f32, f32),
     pub loop_enabled: bool,
     /// Pinned: tape load/splice/clear won't replace this pad's sample.
-    /// Explicit per-pad actions (browser load, edits) still apply.
+    /// Explicit per-pad actions (browser load, chop assign, edits)
+    /// still apply.
     pub locked: bool,
 }
 
@@ -451,6 +452,50 @@ impl Engine {
         self.refresh_pad_samples();
     }
 
+    /// Assign any tape chop to any pad (or None to restore the pad's
+    /// default: its own chop, else its drum-mode sample). Explicit, so
+    /// it replaces even a locked pad's sample — like an explicit file
+    /// load — and trim/reverse edits stay applied on top. Assignments
+    /// are by chop number: they survive a re-splice while that chop
+    /// still exists, and a fresh tape clears them for unlocked pads.
+    /// Returns a status line, or an error message.
+    pub fn assign_chop(&mut self, pad: usize, chop: Option<usize>) -> Result<String, String> {
+        if pad >= N_PADS {
+            return Err("BAD PAD".to_string());
+        }
+        let (audio, chops) = match &self.tape {
+            Some(t) if !t.audio.is_empty() => (t.audio.clone(), t.chops.clone()),
+            _ => return Err("NO TAPE".to_string()),
+        };
+        if let Some(c) = chop {
+            if c >= chops.len() {
+                return Err(format!(
+                    "CHOP {} OUT OF RANGE ({} CHOPS)",
+                    c + 1,
+                    chops.len()
+                ));
+            }
+        }
+        let (sample, m) = match chop {
+            Some(c) => {
+                let (a, b) = chops[c];
+                (audio[a..b].to_vec(), Some(c))
+            }
+            None => {
+                if pad < chops.len() {
+                    let (a, b) = chops[pad];
+                    (audio[a..b].to_vec(), Some(pad))
+                } else {
+                    (self.pad_factory[pad].clone(), None)
+                }
+            }
+        };
+        self.chop_map[pad] = m;
+        self.pads[pad].source = sample;
+        self.pads[pad].rebuild();
+        Ok(format!("PAD {} <- {}", pad + 1, self.pad_label(pad)))
+    }
+
     /// Re-derive pad samples from the tape + chop map. Pads without a chop
     /// (or with no tape audio) play their drum-mode sample. Trim/reverse
     /// edits apply on top of whatever source lands here.
@@ -459,12 +504,11 @@ impl Engine {
             .map(|i| {
                 if let Some(t) = &self.tape {
                     if !t.audio.is_empty() {
-                        let n = t.chops.len().min(N_PADS);
                         let ci = match self.chop_map[i] {
                             Some(c) if c < t.chops.len() => c,
                             _ => i,
                         };
-                        if ci < n {
+                        if ci < t.chops.len() {
                             let (a, b) = t.chops[ci];
                             return (t.audio[a..b].to_vec(), Some(ci));
                         }
@@ -1734,6 +1778,81 @@ mod tests {
         let mut e = Engine::new();
         assert_eq!(e.splice_onset(), None);
         assert_eq!(e.splice_equal(), None);
+    }
+
+    fn many_region_tape() -> Vec<i16> {
+        // 12 onset-separated regions, like the many-chops test.
+        let mut t = Vec::new();
+        for _ in 0..12 {
+            t.push(2047);
+            t.extend(std::iter::repeat(300i16).take(3000));
+        }
+        t
+    }
+
+    #[test]
+    fn assign_chop_arbitrary_and_survives_resplice() {
+        let mut e = Engine::new();
+        let n = e.load_tape("MANY".to_string(), many_region_tape());
+        assert!(n >= 12, "got {n}");
+        // Pad 1 takes chop 12: beyond the first eight pads' defaults.
+        let m = e.assign_chop(0, Some(11)).unwrap();
+        assert_eq!(m, "PAD 1 <- CHOP 12");
+        assert_eq!(e.pad_label(0), "CHOP 12");
+        assert_eq!(e.chop_map[0], Some(11));
+        let (a, b) = e.tape.as_ref().unwrap().chops[11];
+        assert_eq!(
+            e.pads[0].source,
+            e.tape.as_ref().unwrap().audio[a..b].to_vec()
+        );
+        // Re-splice the same audio: onset chops are identical, so the
+        // assignment survives. (Before the refresh fix, any assignment
+        // past chop 8 fell back to the drum sample here.)
+        let n2 = e.splice_onset().unwrap();
+        assert_eq!(n2, n);
+        assert_eq!(e.pad_label(0), "CHOP 12");
+        assert_eq!(e.chop_map[0], Some(11));
+        let (a, b) = e.tape.as_ref().unwrap().chops[11];
+        assert_eq!(
+            e.pads[0].source,
+            e.tape.as_ref().unwrap().audio[a..b].to_vec()
+        );
+    }
+
+    #[test]
+    fn assign_chop_errors_and_clear() {
+        let mut e = Engine::new();
+        assert_eq!(e.assign_chop(0, Some(0)).unwrap_err(), "NO TAPE");
+        assert!(e.assign_chop(8, Some(0)).is_err());
+        let n = e.load_tape("MANY".to_string(), many_region_tape());
+        assert!(n >= 12, "got {n}");
+        // Index n is out of range.
+        assert!(e.assign_chop(0, Some(n)).is_err());
+        // Clear: pad 1 back to its own chop.
+        e.assign_chop(0, Some(11)).unwrap();
+        let m = e.assign_chop(0, None).unwrap();
+        assert_eq!(m, "PAD 1 <- CHOP 1");
+        assert_eq!(e.chop_map[0], Some(0));
+        // Clear a pad past the chop count: back to its drum sample.
+        let mut e = Engine::new();
+        e.load_tape("FOUR".to_string(), region_tape());
+        e.assign_chop(4, Some(1)).unwrap();
+        assert_eq!(e.pad_label(4), "CHOP 2");
+        let m = e.assign_chop(4, None).unwrap();
+        assert_eq!(m, "PAD 5 <- CHAT");
+        assert_eq!(e.chop_map[4], None);
+    }
+
+    #[test]
+    fn assign_chop_overrides_lock() {
+        let mut e = Engine::new();
+        e.set_locked(0, true);
+        e.load_tape("T".to_string(), many_region_tape());
+        assert_eq!(e.pad_label(0), "KICK"); // locked: kept its drum
+        let m = e.assign_chop(0, Some(1)).unwrap();
+        assert_eq!(m, "PAD 1 <- CHOP 2");
+        assert_eq!(e.chop_map[0], Some(1));
+        assert_ne!(e.pads[0].source, e.pad_factory[0]);
     }
 
     #[test]

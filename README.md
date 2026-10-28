@@ -127,6 +127,7 @@ it.
 | `:bpm N` / `:swing N` | Set BPM (0–256; 0 parks the sequencer) / swing (50–75%) |
 | `:steps N` | Set sequence length, 8–64 steps (clamped; exact values, unlike `-`/`=`) |
 | `:pad N` / `:track N` | Select pad (1–8) / 4-track track (1–4) |
+| `:chop [PAD] CHOP` / `:chop [PAD] CLEAR` | Assign any tape chop to a pad (both 1-based; one-arg form targets the selected pad) / restore the pad's default chop or drum sample |
 | `:loop` | Toggle looping on the selected pad |
 | `:loop on` / `:loop off` | Enable / disable looping |
 | `:loop START_S END_S` | Set loop points in seconds and enable looping |
@@ -152,7 +153,14 @@ drag-and-drop all accept `.wav` and `.mp3`.
 
 On load the tape is auto-spliced by onset detection; `S` re-splices, `E`
 slices into 8 equal parts, `D` clears it. Pads 1–8 trigger chops 1–8 (more
-than 8 chops: the first 8; the readout shows `8/N CHOPS`). Per-pad tune still
+than 8 chops: the first 8; the readout shows `8/N CHOPS`). Any chop can
+be assigned to any pad with `:chop [PAD] CHOP` — `:chop 12` puts chop 12
+on the selected pad, `:chop 3 12` puts it on pad 3, `:chop 3 clear`
+restores pad 3's default. Assignments are by chop number, so they
+survive a re-splice while that chop still exists; a fresh tape clears
+them for unlocked pads, and an explicit assignment overrides a pad lock
+the way an explicit file load does. Assignments save into native
+projects. Per-pad tune still
 applies — varispeed on chops, the classic. The step sequencer keeps working
 and fires chops like drums.
 
