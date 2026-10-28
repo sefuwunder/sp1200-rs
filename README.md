@@ -75,6 +75,7 @@ or loaded WAV). Edits are non-destructive except normalize.
 | `-` / `=` | Filter resonance (Q), 0.1 – 12 |
 | `M` | Mono/poly per pad: mono retriggering cuts the pad's own ringing voices |
 | `[` / `]` | Pad pitch −/+ 1 semitone (±24 st) |
+| `PgUp` / `PgDn` | Step the pad's tape chop assignment back / forward (wraps; `:chop` assigns exactly) |
 | `L` | Toggle pad looping: the voice plays the sample once, then repeats the loop region forever |
 | `Shift+Z` / `Shift+X` | Loop start −/+ (same gesture as trim, shifted) |
 | `Shift+C` / `Shift+V` | Loop end −/+ |

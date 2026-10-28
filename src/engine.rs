@@ -496,6 +496,35 @@ impl Engine {
         Ok(format!("PAD {} <- {}", pad + 1, self.pad_label(pad)))
     }
 
+    /// Step the pad's chop assignment to the next (forward) or
+    /// previous chop, wrapping around the tape's chops. A pad with no
+    /// assignment starts at the first chop (forward) or the last
+    /// (backward). Delegates to `assign_chop`, so the same rules
+    /// apply (explicit, overrides lock, trim/reverse stay applied).
+    pub fn cycle_chop(&mut self, pad: usize, forward: bool) -> Result<String, String> {
+        if pad >= N_PADS {
+            return Err("BAD PAD".to_string());
+        }
+        let n = match &self.tape {
+            Some(t) if !t.audio.is_empty() => t.chops.len(),
+            _ => return Err("NO TAPE".to_string()),
+        };
+        if n == 0 {
+            return Err("NO CHOPS".to_string());
+        }
+        let cur = match self.chop_map[pad] {
+            Some(c) if c < n => Some(c),
+            _ => None,
+        };
+        let next = match (cur, forward) {
+            (Some(c), true) => (c + 1) % n,
+            (Some(c), false) => (c + n - 1) % n,
+            (None, true) => 0,
+            (None, false) => n - 1,
+        };
+        self.assign_chop(pad, Some(next))
+    }
+
     /// Re-derive pad samples from the tape + chop map. Pads without a chop
     /// (or with no tape audio) play their drum-mode sample. Trim/reverse
     /// edits apply on top of whatever source lands here.
@@ -1841,6 +1870,29 @@ mod tests {
         let m = e.assign_chop(4, None).unwrap();
         assert_eq!(m, "PAD 5 <- CHAT");
         assert_eq!(e.chop_map[4], None);
+    }
+
+    #[test]
+    fn cycle_chop_wraps_and_starts_from_unassigned() {
+        let mut e = Engine::new();
+        assert!(e.cycle_chop(0, true).is_err()); // no tape
+        assert!(e.cycle_chop(8, true).is_err()); // bad pad
+        let n = e.load_tape("MANY".to_string(), many_region_tape());
+        assert!(n >= 12, "got {n}");
+        // Pad 1 defaults to chop 1: forward steps, backward wraps.
+        assert_eq!(e.cycle_chop(0, true).unwrap(), "PAD 1 <- CHOP 2");
+        assert_eq!(e.cycle_chop(0, false).unwrap(), "PAD 1 <- CHOP 1");
+        assert_eq!(
+            e.cycle_chop(0, false).unwrap(),
+            format!("PAD 1 <- CHOP {n}")
+        );
+        assert_eq!(e.cycle_chop(0, true).unwrap(), "PAD 1 <- CHOP 1");
+        // A pad past the chop count has no assignment: forward starts
+        // at the first chop, backward at the last.
+        let mut e = Engine::new();
+        e.load_tape("FOUR".to_string(), region_tape());
+        assert_eq!(e.cycle_chop(4, true).unwrap(), "PAD 5 <- CHOP 1");
+        assert_eq!(e.cycle_chop(4, false).unwrap(), "PAD 5 <- CHOP 4");
     }
 
     #[test]

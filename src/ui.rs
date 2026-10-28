@@ -432,6 +432,25 @@ pub fn handle_event(ui: &mut Ui, eng: &mut Engine, ev: &Event) -> bool {
                         eng.nudge_cutoff(i, false);
                         true
                     }
+                    // Step the selected pad's chop assignment through
+                    // the tape's chops, wrapping around. PgUp/PgDn are
+                    // free on every page (unlike the arrows, which are
+                    // swing globally and cutoff here), so cycling never
+                    // steals a muscle-memory key.
+                    Keycode::PageUp => {
+                        match eng.cycle_chop(i, false) {
+                            Ok(m) => ui.say(m),
+                            Err(e) => ui.say_err(e),
+                        }
+                        true
+                    }
+                    Keycode::PageDown => {
+                        match eng.cycle_chop(i, true) {
+                            Ok(m) => ui.say(m),
+                            Err(e) => ui.say_err(e),
+                        }
+                        true
+                    }
                     _ => false,
                 };
                 if handled {
@@ -2028,6 +2047,36 @@ mod tests {
         // Out-of-range chop is an error, not a silent no-op.
         run_command(&mut ui, &mut eng, "chop 1 99");
         assert_eq!(eng.pad_label(0), "CHOP 1");
+    }
+
+    #[test]
+    fn edit_page_pgup_pgdn_cycles_chops() {
+        let mut eng = Engine::new();
+        let mut audio = Vec::new();
+        for _ in 0..12 {
+            audio.push(2047);
+            audio.extend(std::iter::repeat(300i16).take(3000));
+        }
+        let n = eng.load_tape("T".to_string(), audio);
+        assert!(n >= 12, "got {n}");
+        let mut ui = Ui::new();
+        ui.page = Page::Edit;
+        ui.selected_pad = 0;
+        let key = |kc| Event::KeyDown {
+            timestamp: 0,
+            window_id: 0,
+            keycode: Some(kc),
+            scancode: None,
+            keymod: sdl2::keyboard::Mod::NOMOD,
+            repeat: false,
+        };
+        // Pad 1 defaults to chop 1; PgDn steps forward, PgUp wraps back.
+        assert!(!handle_event(&mut ui, &mut eng, &key(Keycode::PageDown)));
+        assert_eq!(eng.pad_label(0), "CHOP 2");
+        assert!(!handle_event(&mut ui, &mut eng, &key(Keycode::PageUp)));
+        assert_eq!(eng.pad_label(0), "CHOP 1");
+        assert!(!handle_event(&mut ui, &mut eng, &key(Keycode::PageUp)));
+        assert_eq!(eng.pad_label(0), format!("CHOP {n}"));
     }
 
     #[test]
