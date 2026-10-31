@@ -124,7 +124,7 @@ it.
 | Command | Action |
 |---|---|
 | `:help` | List commands (one line; this file has the details) |
-| `:w` / `:q` | Save the project / quit |
+| `:w` / `:w FILE` / `:q` | Save to the current file / to FILE (which becomes the current file; a bare name gains `.json`) / quit |
 | `:bpm N` / `:swing N` | Set BPM (0–256; 0 parks the sequencer) / swing (50–75%) |
 | `:steps N` | Set sequence length, 8–64 steps (clamped; exact values, unlike `-`/`=`) |
 | `:pad N` / `:track N` | Select pad (1–8) / 4-track track (1–4) |

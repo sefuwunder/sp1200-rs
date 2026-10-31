@@ -839,14 +839,34 @@ fn save_project(ui: &mut Ui, eng: &mut Engine) {
         .project_path
         .clone()
         .unwrap_or_else(|| "./sp1200-project.json".to_string());
+    save_project_to(ui, eng, &path);
+}
+
+/// Save to an explicit path and make it the current project file,
+/// so a later bare :W rewrites it. A bare name gains .json so the
+/// file stays re-openable (drop/open only accepts .json).
+fn save_project_as(ui: &mut Ui, eng: &mut Engine, arg: &str) {
+    let mut path = arg.to_string();
+    let has_ext = path
+        .rsplit(['/', '\\'])
+        .next()
+        .map(|f| f.contains('.'))
+        .unwrap_or(false);
+    if !has_ext {
+        path.push_str(".json");
+    }
+    save_project_to(ui, eng, &path);
+}
+
+fn save_project_to(ui: &mut Ui, eng: &mut Engine, path: &str) {
     let stem = path
         .rsplit(['/', '\\'])
         .next()
         .unwrap_or("sp1200-project.json");
     let name = stem.rsplit_once('.').map(|(s, _)| s).unwrap_or(stem);
-    match crate::project::save_native_file(eng, &path, name) {
+    match crate::project::save_native_file(eng, path, name) {
         Ok(()) => {
-            ui.project_path = Some(path.clone());
+            ui.project_path = Some(path.to_string());
             ui.say(format!("SAVED {path}"));
         }
         Err(e) => ui.say_err(e),
@@ -944,8 +964,23 @@ fn run_command(ui: &mut Ui, eng: &mut Engine, input: &str) -> bool {
     };
     let num = |s: &str| s.parse::<f64>().ok();
     match cmd.as_str() {
-        "help" => ui.say("W SAVE Q QUIT BPM SWING PAD TRACK LOOP TTRIM RESAMPLE REC STOP PLAY WARMTH DISTORT STEPS CHOP - SEE README"),
-        "w" => save_project(ui, eng),
+        "help" => ui.say("W [FILE] SAVE Q QUIT BPM SWING PAD TRACK LOOP TTRIM RESAMPLE REC STOP PLAY WARMTH DISTORT STEPS CHOP - SEE README"),
+        "w" => {
+            // :W saves to the current file; :W FILE saves there and
+            // makes it the current file, like vim. The rest of the
+            // line is the filename, so names with spaces work.
+            let rest = input
+                .trim_start()
+                .splitn(2, char::is_whitespace)
+                .nth(1)
+                .unwrap_or("")
+                .trim();
+            if rest.is_empty() {
+                save_project(ui, eng);
+            } else {
+                save_project_as(ui, eng, rest);
+            }
+        }
         "q" => return true,
         "bpm" => match num(next_arg(&mut parts)) {
             Some(n) => {
@@ -2183,6 +2218,70 @@ mod tests {
         assert!(!ui.msg.as_ref().unwrap().2);
         assert!(!run_command(&mut ui, &mut eng, ""));
         assert!(run_command(&mut ui, &mut eng, "q"));
+    }
+
+    #[test]
+    fn w_command_saves_to_named_file_and_sets_current() {
+        let dir = std::env::temp_dir().join(format!("sp1200rs-wcmd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut eng = Engine::new();
+        let mut ui = Ui::new();
+
+        // A bare name gains .json so the file stays re-openable, and
+        // it becomes the current file.
+        let bare = dir.join("mybeat");
+        assert!(!run_command(
+            &mut ui,
+            &mut eng,
+            &format!("w {}", bare.display())
+        ));
+        let saved = dir.join("mybeat.json");
+        assert!(saved.exists());
+        assert_eq!(ui.project_path.as_deref(), Some(saved.to_str().unwrap()));
+        assert!(ui.msg.as_ref().unwrap().0.contains("SAVED"));
+
+        // An explicit extension is kept as-is, never doubled.
+        let explicit = dir.join("other.json");
+        assert!(!run_command(
+            &mut ui,
+            &mut eng,
+            &format!("w {}", explicit.display())
+        ));
+        assert!(explicit.exists());
+        assert!(!dir.join("other.json.json").exists());
+
+        // Names with spaces work: the rest of the line is the filename.
+        let spaced = dir.join("my beat");
+        assert!(!run_command(
+            &mut ui,
+            &mut eng,
+            &format!("w {}", spaced.display())
+        ));
+        let spaced_saved = dir.join("my beat.json");
+        assert!(spaced_saved.exists());
+
+        // A bare :W afterwards rewrites the current file.
+        eng.bpm = 123.0;
+        assert!(!run_command(&mut ui, &mut eng, "w"));
+        let mut eng2 = Engine::new();
+        assert!(
+            crate::project::load_project_file(&mut eng2, spaced_saved.to_str().unwrap()).is_ok()
+        );
+        assert_eq!(eng2.bpm, 123.0);
+
+        // An unwritable path errors cleanly and keeps the old current file.
+        assert!(!run_command(
+            &mut ui,
+            &mut eng,
+            "w /no-such-dir-xyz/foo.json"
+        ));
+        assert!(ui.msg.as_ref().unwrap().2);
+        assert_eq!(
+            ui.project_path.as_deref(),
+            Some(spaced_saved.to_str().unwrap())
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
