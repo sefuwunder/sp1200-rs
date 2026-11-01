@@ -964,7 +964,7 @@ fn run_command(ui: &mut Ui, eng: &mut Engine, input: &str) -> bool {
     };
     let num = |s: &str| s.parse::<f64>().ok();
     match cmd.as_str() {
-        "help" => ui.say("W [FILE] SAVE Q QUIT BPM SWING PAD TRACK LOOP TTRIM RESAMPLE REC STOP PLAY WARMTH DISTORT STEPS CHOP - SEE README"),
+        "help" => ui.say("W [FILE] SAVE Q QUIT BPM SWING PAD TRACK LOOP TTRIM RESAMPLE REC STOP PLAY WARMTH DISTORT STEPS CHOP LFO - SEE README"),
         "w" => {
             // :W saves to the current file; :W FILE saves there and
             // makes it the current file, like vim. The rest of the
@@ -1017,6 +1017,50 @@ fn run_command(ui: &mut Ui, eng: &mut Engine, input: &str) -> bool {
             }
             None => ui.say_err("USAGE: :DISTORT 50"),
         },
+        // Per-pad LFO routing to the filter: :LFO RATE 5 | CUT 12 |
+        // RES 2 | OFF. Targets the selected pad; depths are 0 by
+        // default (unrouted), so setting one alone starts a sweep.
+        "lfo" => {
+            let sub = next_arg(&mut parts).to_ascii_lowercase();
+            match sub.as_str() {
+                "off" => {
+                    eng.set_lfo_cut(ui.selected_pad, 0.0);
+                    eng.set_lfo_res(ui.selected_pad, 0.0);
+                    ui.say("LFO OFF");
+                }
+                "rate" => match num(next_arg(&mut parts)) {
+                    Some(n) => {
+                        eng.set_lfo_rate(ui.selected_pad, n as f32);
+                        ui.say(format!(
+                            "LFO RATE {:.1}HZ",
+                            eng.pads[ui.selected_pad].lfo_rate
+                        ));
+                    }
+                    None => ui.say_err("USAGE: :LFO RATE 5"),
+                },
+                "cut" => match num(next_arg(&mut parts)) {
+                    Some(n) => {
+                        eng.set_lfo_cut(ui.selected_pad, n as f32);
+                        ui.say(format!(
+                            "LFO CUT {:+.0}ST",
+                            eng.pads[ui.selected_pad].lfo_cut
+                        ));
+                    }
+                    None => ui.say_err("USAGE: :LFO CUT 12"),
+                },
+                "res" => match num(next_arg(&mut parts)) {
+                    Some(n) => {
+                        eng.set_lfo_res(ui.selected_pad, n as f32);
+                        ui.say(format!(
+                            "LFO RES {:+.2}Q",
+                            eng.pads[ui.selected_pad].lfo_res
+                        ));
+                    }
+                    None => ui.say_err("USAGE: :LFO RES 2"),
+                },
+                _ => ui.say_err("USAGE: :LFO RATE 5 | CUT 12 | RES 2 | OFF"),
+            }
+        }
         "pad" => match next_arg(&mut parts).parse::<usize>() {
             Ok(n) if (1..=8).contains(&n) => {
                 ui.selected_pad = n - 1;
@@ -1629,6 +1673,14 @@ fn draw_edit(p: &mut dyn Painter, ui: &Ui, eng: &Engine) {
         format!("FILTER {}", pad.filter_kind.abbrev()),
         format!("CUTOFF {:04.0} HZ", pad.filter_cutoff),
         format!("RES Q{:.2}", pad.filter_res),
+        if pad.lfo_cut == 0.0 && pad.lfo_res == 0.0 {
+            "LFO OFF".to_string()
+        } else {
+            format!(
+                "LFO {:.1}HZ CUT {:+.0}ST RES {:+.2}Q",
+                pad.lfo_rate, pad.lfo_cut, pad.lfo_res
+            )
+        },
     ];
     for (r, s) in right.iter().enumerate() {
         p.text(560, y0 + r as i32 * 24, s, 1, TEXT);
@@ -2218,6 +2270,36 @@ mod tests {
         assert!(!ui.msg.as_ref().unwrap().2);
         assert!(!run_command(&mut ui, &mut eng, ""));
         assert!(run_command(&mut ui, &mut eng, "q"));
+    }
+
+    #[test]
+    fn lfo_command_routes_to_selected_pad_and_clears() {
+        let mut eng = Engine::new();
+        let mut ui = Ui::new();
+        assert!(!run_command(&mut ui, &mut eng, "pad 2"));
+        assert_eq!(ui.selected_pad, 1);
+        assert!(!run_command(&mut ui, &mut eng, "lfo rate 7.5"));
+        assert!((eng.pads[1].lfo_rate - 7.5).abs() < 1e-6);
+        assert!(ui.msg.as_ref().unwrap().0.contains("7.5HZ"));
+        assert!(!run_command(&mut ui, &mut eng, "lfo cut 12"));
+        assert_eq!(eng.pads[1].lfo_cut, 12.0);
+        assert!(!run_command(&mut ui, &mut eng, "lfo res 2"));
+        assert_eq!(eng.pads[1].lfo_res, 2.0);
+        // Other pads untouched.
+        assert_eq!(eng.pads[0].lfo_cut, 0.0);
+        assert_eq!(eng.pads[0].lfo_res, 0.0);
+        // Off clears depths but keeps the rate.
+        assert!(!run_command(&mut ui, &mut eng, "lfo off"));
+        assert_eq!(eng.pads[1].lfo_cut, 0.0);
+        assert_eq!(eng.pads[1].lfo_res, 0.0);
+        assert!((eng.pads[1].lfo_rate - 7.5).abs() < 1e-6);
+        // Bad forms are usage errors, never panics.
+        assert!(!run_command(&mut ui, &mut eng, "lfo"));
+        assert!(ui.msg.as_ref().unwrap().2);
+        assert!(!run_command(&mut ui, &mut eng, "lfo rate"));
+        assert!(ui.msg.as_ref().unwrap().2);
+        assert!(!run_command(&mut ui, &mut eng, "lfo frobnicate 5"));
+        assert!(ui.msg.as_ref().unwrap().2);
     }
 
     #[test]

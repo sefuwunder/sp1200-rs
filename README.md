@@ -134,11 +134,12 @@ it.
 | `:loop START_S END_S` | Set loop points in seconds and enable looping |
 | `:ttrim START_S END_S` / `:ttrim full` | Set / clear the selected track's trim window |
 | `:resample [TRACK] [PAD]` | Resample a track's trimmed region onto a pad (defaults: selected track → same-number pad) |
+| `:lfo rate HZ` / `:lfo cut ST` / `:lfo res Q` / `:lfo off` | Per-pad sine LFO, routable to the filter: rate (0–20 Hz, 0 = held), cutoff depth (±48 semitones), resonance depth (±12 Q). Targets the selected pad; depths are 0 (unrouted) by default, so setting one alone starts a sweep. The LFO restarts on every hit, so sweeps are consistent per hit, and its routing shows on the Edit page's filter readout |
 | `:rec` / `:rec all` | Record armed tracks / record all four tracks |
 | `:stop` / `:rewind` / `:play` | Stop (keep playhead) / stop + rewind / play-stop the tape |
 
 `sp1200-rs --pad 3 kick.wav` loads a WAV onto pad 3 at startup. Choke
-groups, filters (cutoff + resonance), mono/poly, pitch, trim, reverse, and user samples are saved into native
+groups, filters (cutoff + resonance), LFO routing to the filter, mono/poly, pitch, trim, reverse, and user samples are saved into native
 projects (`W`); user samples are embedded as base64, so the project is
 self-contained.
 

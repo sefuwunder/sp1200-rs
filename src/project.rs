@@ -160,6 +160,15 @@ pub struct NativePad {
     pub cutoff: f32,
     #[serde(default = "def_res")]
     pub res: f32, // filter resonance (Q)
+    /// Per-pad LFO routing: rate in Hz (0 = held), cutoff depth in
+    /// semitones, resonance depth in Q. All default to unrouted in
+    /// older files, which keeps their sound unchanged.
+    #[serde(default = "def_lfo_rate")]
+    pub lfo_rate: f32,
+    #[serde(default)]
+    pub lfo_cut: f32,
+    #[serde(default)]
+    pub lfo_res: f32,
     #[serde(default)]
     pub choke: u8, // 0 = none
     #[serde(default = "def_trim")]
@@ -187,6 +196,10 @@ fn def_cutoff() -> f32 {
 
 fn def_res() -> f32 {
     0.71
+}
+
+fn def_lfo_rate() -> f32 {
+    5.0
 }
 
 fn def_trim() -> [f32; 2] {
@@ -362,6 +375,10 @@ pub fn apply_native(eng: &mut Engine, p: &NativeProject) {
         eng.pads[i].rebuild();
         eng.set_filter(i, FilterKind::from_str(&pad.filter), pad.cutoff);
         eng.set_res(i, pad.res);
+        eng.set_lfo_rate(i, pad.lfo_rate);
+        eng.set_lfo_cut(i, pad.lfo_cut);
+        eng.set_lfo_res(i, pad.lfo_res);
+        eng.pads[i].lfo_phase = 0.0;
         eng.set_choke(i, pad.choke);
         eng.set_mono(i, pad.mono);
         eng.pads[i].locked = pad.locked;
@@ -480,6 +497,9 @@ pub fn save_native(eng: &Engine, name: &str) -> String {
             filter: p.filter_kind.as_str().to_string(),
             cutoff: p.filter_cutoff,
             res: p.filter_res,
+            lfo_rate: p.lfo_rate,
+            lfo_cut: p.lfo_cut,
+            lfo_res: p.lfo_res,
             mono: p.mono,
             choke: p.choke,
             trim: [p.trim.0, p.trim.1],
@@ -937,6 +957,35 @@ mod tests {
         assert_eq!(e2.pads[0].filter_kind, FilterKind::Off);
         assert_eq!(e2.pads[0].choke, 0);
         assert!(!e2.pads[0].custom);
+    }
+
+    #[test]
+    fn lfo_fields_round_trip_and_default_unrouted() {
+        let mut e = Engine::new();
+        e.set_lfo_rate(1, 7.5);
+        e.set_lfo_cut(1, 12.0);
+        e.set_lfo_res(1, 2.0);
+        let json = save_native(&e, "lfo");
+        assert!(json.contains("\"lfo_rate\": 7.5"), "{json}");
+        assert!(json.contains("\"lfo_cut\": 12.0"), "{json}");
+        assert!(json.contains("\"lfo_res\": 2.0"), "{json}");
+        let p = parse_native(&json).unwrap();
+        let mut e2 = Engine::new();
+        apply_native(&mut e2, &p);
+        assert!((e2.pads[1].lfo_rate - 7.5).abs() < 1e-6);
+        assert_eq!(e2.pads[1].lfo_cut, 12.0);
+        assert_eq!(e2.pads[1].lfo_res, 2.0);
+        assert_eq!(e2.pads[1].lfo_phase, 0.0);
+        // Pads never touched keep the unrouted defaults.
+        assert_eq!(e2.pads[0].lfo_cut, 0.0);
+        assert_eq!(e2.pads[0].lfo_res, 0.0);
+        // A pad object without the LFO keys (an older file) parses to
+        // the same unrouted defaults: rate present but depths zero,
+        // so its sound is unchanged.
+        let pad: NativePad = serde_json::from_str("{\"tune\":0.0,\"level\":0.9}").unwrap();
+        assert_eq!(pad.lfo_rate, 5.0);
+        assert_eq!(pad.lfo_cut, 0.0);
+        assert_eq!(pad.lfo_res, 0.0);
     }
 
     #[test]

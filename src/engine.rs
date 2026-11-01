@@ -31,6 +31,11 @@ pub const RENDER_SEED: u32 = 0x12_345678;
 /// Default filter cutoff when a filter is first engaged.
 pub const FILTER_DEFAULT_CUTOFF: f32 = 3000.0;
 
+/// Default per-pad LFO rate in Hz. Depths default to 0 (unrouted), so
+/// this rate is inaudible until a depth is set — setting a depth alone
+/// then immediately sweeps.
+pub const LFO_DEFAULT_RATE: f32 = 5.0;
+
 /// BPM range: 0 parks the sequencer (manual pad triggers still sound),
 /// 256 is the top. Every clamp in the UI and project loaders uses these
 /// so the range can't drift apart again.
@@ -54,6 +59,16 @@ pub struct Pad {
     pub filter_cutoff: f32,
     /// Filter resonance (Q), 0.1..12.
     pub filter_res: f32,
+    /// Per-pad sine LFO, routable to the filter: rate in Hz, plus one
+    /// depth per destination (0 = unrouted). `lfo_phase` is runtime
+    /// state only — it advances with the engine clock, resets on
+    /// trigger, and is never saved.
+    pub lfo_rate: f32,
+    /// Cutoff depth in semitones around the base cutoff, ±48.
+    pub lfo_cut: f32,
+    /// Resonance depth in Q units around the base Q, ±12.
+    pub lfo_res: f32,
+    pub lfo_phase: f64,
     /// Precomputed biquad coefficients (b0,b1,b2 / a1,a2), refreshed by
     /// `set_filter` / `set_res`.
     pub fb: [f32; 3],
@@ -88,6 +103,10 @@ impl Pad {
             filter_kind: FilterKind::Off,
             filter_cutoff: FILTER_DEFAULT_CUTOFF,
             filter_res: 0.71,
+            lfo_rate: LFO_DEFAULT_RATE,
+            lfo_cut: 0.0,
+            lfo_res: 0.0,
+            lfo_phase: 0.0,
             fb,
             fa,
             mono: false,
@@ -147,6 +166,27 @@ impl Pad {
         );
         self.fb = fb;
         self.fa = fa;
+    }
+
+    /// True when the LFO is routed to either filter destination.
+    pub fn lfo_routed(&self) -> bool {
+        self.lfo_cut != 0.0 || self.lfo_res != 0.0
+    }
+
+    /// Current LFO value, -1..=1: sine, phase 0 = zero crossing rising.
+    pub fn lfo_value(&self) -> f32 {
+        (std::f64::consts::TAU * self.lfo_phase).sin() as f32
+    }
+
+    /// Effective cutoff + resonance with the LFO applied: cutoff moves
+    /// in semitones around the base, resonance moves additively in Q,
+    /// both clamped to the same ranges as the static setters.
+    pub fn effective_filter(&self) -> (f32, f32) {
+        let v = self.lfo_value();
+        let cutoff = (self.filter_cutoff * 2f32.powf(v * self.lfo_cut / 12.0))
+            .clamp(80.0, 12000.0);
+        let res = (self.filter_res + v * self.lfo_res).clamp(0.1, 12.0);
+        (cutoff, res)
     }
 
     /// Loop region in playable-sample indices, or None when looping is
@@ -327,6 +367,9 @@ impl Engine {
             age: self.voice_age,
             fstate: [0.0; 4],
         };
+        // The pad's LFO restarts on every hit, so sweeps are consistent
+        // per hit whether the pad fires from keys or the sequencer.
+        self.pads[pad].lfo_phase = 0.0;
         self.pad_hit_at[pad] = self.clock;
     }
 
@@ -641,6 +684,29 @@ impl Engine {
         self.set_res(i, q);
     }
 
+    /// Set the pad's LFO rate in Hz, clamped 0..20 (0 = held).
+    pub fn set_lfo_rate(&mut self, i: usize, hz: f32) {
+        if i < N_PADS {
+            self.pads[i].lfo_rate = hz.clamp(0.0, 20.0);
+        }
+    }
+
+    /// Route the LFO to the filter cutoff: depth in semitones, ±48.
+    /// 0 unroutes (the default: no modulation, no behavior change).
+    pub fn set_lfo_cut(&mut self, i: usize, st: f32) {
+        if i < N_PADS {
+            self.pads[i].lfo_cut = st.clamp(-48.0, 48.0);
+        }
+    }
+
+    /// Route the LFO to the filter resonance: depth in Q, ±12.
+    /// 0 unroutes (the default: no modulation, no behavior change).
+    pub fn set_lfo_res(&mut self, i: usize, q: f32) {
+        if i < N_PADS {
+            self.pads[i].lfo_res = q.clamp(-12.0, 12.0);
+        }
+    }
+
     /// Nudge the pad's pitch in semitones, clamped -24..+24.
     pub fn nudge_pitch(&mut self, i: usize, delta_st: f32) {
         if i >= N_PADS {
@@ -881,6 +947,24 @@ impl Engine {
                 self.next_step_at = self.pattern_start + js_round(t * SP_RATE) as u64;
             }
             let mut mix = 0.0f32;
+            // Per-pad LFOs: advance phase and refresh modulated filter
+            // coefficients once per sample, before the voices read them.
+            // Unrouted pads skip the recompute entirely, and Off filters
+            // skip it too, so the default path is bit-identical to
+            // before. Phase still advances for routed Off pads so that
+            // engaging the filter later doesn't jump.
+            for pad in self.pads.iter_mut() {
+                if !pad.lfo_routed() {
+                    continue;
+                }
+                pad.lfo_phase = (pad.lfo_phase + pad.lfo_rate as f64 / SP_RATE) % 1.0;
+                if pad.filter_kind != FilterKind::Off {
+                    let (cutoff, q) = pad.effective_filter();
+                    let (fb, fa) = dsp::biquad_coeffs(pad.filter_kind, cutoff, q, SP_RATE);
+                    pad.fb = fb;
+                    pad.fa = fa;
+                }
+            }
             for v in self.voices.iter_mut() {
                 if !v.active {
                     continue;
@@ -1576,6 +1660,90 @@ mod tests {
         e2.nudge_cutoff(0, true);
         assert!(e2.pads[0].filter_cutoff > 400.0);
         assert_ne!(e2.pads[0].fb, before);
+    }
+
+    #[test]
+    fn lfo_effective_filter_moves_cutoff_and_res() {
+        let mut e = Engine::new();
+        e.set_filter(0, FilterKind::Lowpass, 1000.0);
+        e.set_res(0, 0.71);
+        e.set_lfo_cut(0, 12.0);
+        e.set_lfo_res(0, 2.0);
+        // Phase 0.25 = sine peak: +12 semitones, +2 Q.
+        e.pads[0].lfo_phase = 0.25;
+        let (c, q) = e.pads[0].effective_filter();
+        assert!((c - 2000.0).abs() < 1.0, "cutoff {c}");
+        assert!((q - 2.71).abs() < 1e-4, "res {q}");
+        // Phase 0.75 = sine trough: -12 semitones, Q clamped at 0.1.
+        e.pads[0].lfo_phase = 0.75;
+        let (c, q) = e.pads[0].effective_filter();
+        assert!((c - 500.0).abs() < 1.0, "cutoff {c}");
+        assert_eq!(q, 0.1);
+        // Unrouted: effective == static, whatever the phase.
+        e.set_lfo_cut(0, 0.0);
+        e.set_lfo_res(0, 0.0);
+        let (c, q) = e.pads[0].effective_filter();
+        assert_eq!(c, 1000.0);
+        assert_eq!(q, 0.71);
+    }
+
+    #[test]
+    fn lfo_setters_clamp_and_ignore_bad_pads() {
+        let mut e = Engine::new();
+        e.set_lfo_rate(0, 99.0);
+        assert_eq!(e.pads[0].lfo_rate, 20.0);
+        e.set_lfo_rate(0, -5.0);
+        assert_eq!(e.pads[0].lfo_rate, 0.0);
+        e.set_lfo_cut(0, 100.0);
+        assert_eq!(e.pads[0].lfo_cut, 48.0);
+        e.set_lfo_res(0, -99.0);
+        assert_eq!(e.pads[0].lfo_res, -12.0);
+        e.set_lfo_rate(99, 5.0);
+        e.set_lfo_cut(99, 5.0);
+        e.set_lfo_res(99, 5.0);
+    }
+
+    #[test]
+    fn lfo_phase_resets_on_trigger_and_advances_in_render() {
+        let mut e = Engine::new();
+        e.set_lfo_cut(0, 12.0);
+        e.pads[0].lfo_phase = 0.5;
+        e.trigger(0);
+        assert_eq!(e.pads[0].lfo_phase, 0.0);
+        let mut blk = vec![0.0f32; 100];
+        e.render(&mut blk);
+        let expected = 100.0 * e.pads[0].lfo_rate as f64 / SP_RATE;
+        assert!((e.pads[0].lfo_phase - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn lfo_routing_changes_rendered_output() {
+        // Sustained noisy source so the filter sweep has signal to bite.
+        let noise: Vec<i16> = (0..26040)
+            .map(|i| ((i * 2654435761u32) >> 16) as i16 % 2047)
+            .collect();
+        let mut plain = Engine::new();
+        plain.pads[0].set_source(noise.clone(), None);
+        plain.pads[0].level = 1.0;
+        plain.master = 1.0;
+        plain.set_filter(0, FilterKind::Lowpass, 1000.0);
+        plain.trigger(0);
+        let mut a = vec![0.0f32; 2604];
+        plain.render(&mut a);
+        let mut swept = Engine::new();
+        swept.pads[0].set_source(noise, None);
+        swept.pads[0].level = 1.0;
+        swept.master = 1.0;
+        swept.set_filter(0, FilterKind::Lowpass, 1000.0);
+        swept.set_lfo_rate(0, 5.0);
+        swept.set_lfo_cut(0, 24.0);
+        swept.trigger(0);
+        let mut b = vec![0.0f32; 2604];
+        swept.render(&mut b);
+        assert_ne!(a, b, "routed LFO left the output unchanged");
+        for v in b.iter() {
+            assert!(v.is_finite());
+        }
     }
 
     #[test]
